@@ -564,7 +564,23 @@ def webhook():
 
 @app.route("/api/webhook", methods=["GET"])
 def health():
-    return {"status": "il bot è online"}
+    url = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+    tg_token = os.environ.get("TELEGRAM_TOKEN", "")
+    channel = os.environ.get("CHANNEL_ID", "")
+    return {
+        "status": "il bot è online",
+        "diagnostica_env": {
+            "UPSTASH_REDIS_REST_URL_presente": bool(url),
+            "UPSTASH_REDIS_REST_URL_inizia_con_https": url.startswith("https://"),
+            "UPSTASH_REDIS_REST_URL_lunghezza": len(url),
+            "UPSTASH_REDIS_REST_TOKEN_presente": bool(token),
+            "UPSTASH_REDIS_REST_TOKEN_lunghezza": len(token),
+            "TELEGRAM_TOKEN_presente": bool(tg_token),
+            "CHANNEL_ID_presente": bool(channel),
+            "CHANNEL_ID_valore": channel,
+        },
+    }
 
 
 # ================= ENDPOINT CRON (promemoria settimanale) =================
