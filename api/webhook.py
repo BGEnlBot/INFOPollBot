@@ -429,11 +429,8 @@ def cmd_start(chat_id, user_id, args):
         return
 
     send_message(chat_id, "Ciao! Se sei amministratore del canale puoi usare:\n"
-                           "/newpoll - crea un sondaggio (si apre una schermata dedicata)\n"
-                           "/editpoll ID - modifica domanda/opzioni (funziona anche per i ricorrenti, es. R3)\n"
-                           "/polls - elenco sondaggi e ricorrenti, con azioni rapide\n"
-                           "/close ID - chiude un sondaggio (chiedendo se eliminarlo)\n"
-                           "/log ID - riepilogo voti di un sondaggio",
+                           "/newpoll - crea un sondaggio\n"
+                           "/polls - gestisci sondaggi e ricorrenti (modifica, chiudi, riapri, elimina, log)",
                  reply_markup={"remove_keyboard": True})
 
 
@@ -476,15 +473,24 @@ def cmd_newpoll(chat_id, user_id):
     send_message(chat_id, "Tocca il bottone per aprire la creazione del sondaggio:", keyboard)
 
 
-def cmd_editpoll(chat_id, user_id, args):
-    if not is_channel_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del canale.")
-        return
-    if not args:
-        send_message(chat_id, "Uso: /editpoll ID  (vedi /polls per gli ID; per i ricorrenti usa es. R3)")
-        return
-    remember_admin_chat(user_id, chat_id)
-    open_edit_webapp(chat_id, args[0])
+def build_log_text(poll_id: str) -> str:
+    raw = redis.lrange(f"log:{poll_id}", 0, -1) or []
+    if not raw:
+        return "Nessun voto registrato per questo sondaggio."
+    events = [json.loads(r) for r in raw]
+    per_user_events, per_user_name = {}, {}
+    for e in events:
+        uid = e["user_id"]
+        per_user_name[uid] = e["name"]
+        per_user_events.setdefault(uid, []).append(e)
+    lines = ["📋 Riepilogo voti", ""]
+    for uid in sorted(per_user_events, key=lambda u: per_user_name[u].lower()):
+        lines.append(f"👤 {per_user_name[uid]}")
+        for i, e in enumerate(per_user_events[uid]):
+            label = "Primo voto" if i == 0 else "Cambio voto"
+            lines.append(f"{label}: {e['new_choice']}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def cmd_polls(chat_id, user_id):
@@ -504,17 +510,23 @@ def cmd_polls(chat_id, user_id):
         if not p:
             continue
         if p["closed"]:
-            text = f"#{pid} [chiuso] {p['question']}"
-            keyboard = {"inline_keyboard": [[
-                {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{pid}"},
-                {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{pid}"},
-            ]]}
+            text = f"🔒 {p['question']}\n(chiuso)"
+            keyboard = {"inline_keyboard": [
+                [
+                    {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{pid}"},
+                    {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{pid}"},
+                ],
+                [{"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"}],
+            ]}
         else:
-            text = f"#{pid} [attivo] {p['question']}"
-            keyboard = {"inline_keyboard": [[
-                {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{pid}"},
-                {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
-            ]]}
+            text = f"📊 {p['question']}"
+            keyboard = {"inline_keyboard": [
+                [
+                    {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{pid}"},
+                    {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
+                ],
+                [{"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"}],
+            ]}
         send_message(chat_id, text, keyboard)
 
     for tid in tpl_ids:
@@ -522,64 +534,12 @@ def cmd_polls(chat_id, user_id):
         if not t:
             continue
         rid = f"R{tid}"
-        text = f"#{rid} [ricorrente, {WEEKDAY_NAMES[t['weekday']]}] {t['question']}"
+        text = f"📅 Sondaggio Scadenziario (ogni {WEEKDAY_NAMES[t['weekday']]})\n{t['question']}"
         keyboard = {"inline_keyboard": [[
             {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{rid}"},
             {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{rid}"},
         ]]}
         send_message(chat_id, text, keyboard)
-
-
-def cmd_close(chat_id, user_id, args):
-    if not is_channel_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del canale.")
-        return
-    if not args:
-        send_message(chat_id, "Uso: /close ID  (vedi /polls per gli ID)")
-        return
-    poll_id = args[0]
-    poll = get_json(f"poll:{poll_id}")
-    if not poll:
-        send_message(chat_id, "Sondaggio non trovato.")
-        return
-    if poll["closed"]:
-        send_message(chat_id, "Questo sondaggio è già chiuso.")
-        return
-    keyboard = {"inline_keyboard": [[
-        {"text": "🔒 Solo chiudi", "callback_data": f"closeask|keep|{poll_id}"},
-        {"text": "🗑️ Chiudi ed elimina", "callback_data": f"closeask|delete|{poll_id}"},
-    ]]}
-    send_message(chat_id, f"Vuoi chiudere il sondaggio #{poll_id}?\n\n"
-                           "Se lo elimini, sparirà anche dall'elenco (/polls) e i log dei voti andranno persi.",
-                 keyboard)
-
-
-def cmd_log(chat_id, user_id, args):
-    if not is_channel_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del canale.")
-        return
-    if not args:
-        send_message(chat_id, "Uso: /log ID  (vedi /polls per gli ID)")
-        return
-    poll_id = args[0]
-    raw = redis.lrange(f"log:{poll_id}", 0, -1) or []
-    if not raw:
-        send_message(chat_id, "Nessun voto registrato per questo sondaggio.")
-        return
-    events = [json.loads(r) for r in raw]
-    per_user_events, per_user_name = {}, {}
-    for e in events:
-        uid = e["user_id"]
-        per_user_name[uid] = e["name"]
-        per_user_events.setdefault(uid, []).append(e)
-    lines = [f"📋 Riepilogo voti — sondaggio #{poll_id}", ""]
-    for uid in sorted(per_user_events, key=lambda u: per_user_name[u].lower()):
-        lines.append(f"👤 {per_user_name[uid]}")
-        for i, e in enumerate(per_user_events[uid]):
-            label = "Primo voto" if i == 0 else "Cambio voto"
-            lines.append(f"{label}: {e['new_choice']}")
-        lines.append("")
-    send_message(chat_id, "\n".join(lines).strip())
 
 
 # ================= RICEZIONE DATI DALLA WEB APP =================
@@ -776,7 +736,7 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
             answer_callback(callback_id)
         elif action == "delete":
             delete_template_completely(raw, tpl)
-            edit_message(chat_id, message_id, f"🗑️ Sondaggio ricorrente #{item_id} eliminato.")
+            edit_message(chat_id, message_id, "🗑️ Sondaggio ricorrente eliminato.")
             answer_callback(callback_id, "Eliminato.")
         else:
             answer_callback(callback_id, "Azione non disponibile per un sondaggio ricorrente.", alert=True)
@@ -791,43 +751,36 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
         open_edit_webapp(chat_id, item_id)
         answer_callback(callback_id)
 
+    elif action == "log":
+        send_message(chat_id, build_log_text(raw))
+        answer_callback(callback_id)
+
     elif action == "close":
         close_poll_only(raw, poll)
-        edit_message(chat_id, message_id, f"#{raw} [chiuso] {poll['question']}", {"inline_keyboard": [[
-            {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{raw}"},
-            {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{raw}"},
-        ]]})
+        edit_message(chat_id, message_id, f"🔒 {poll['question']}\n(chiuso)", {"inline_keyboard": [
+            [
+                {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{raw}"},
+                {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{raw}"},
+            ],
+            [{"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"}],
+        ]})
         answer_callback(callback_id, "Sondaggio chiuso.")
 
     elif action == "reopen":
         reopen_poll(raw, poll)
-        edit_message(chat_id, message_id, f"#{raw} [attivo] {poll['question']}", {"inline_keyboard": [[
-            {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{raw}"},
-            {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
-        ]]})
+        edit_message(chat_id, message_id, f"📊 {poll['question']}", {"inline_keyboard": [
+            [
+                {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{raw}"},
+                {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
+            ],
+            [{"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"}],
+        ]})
         answer_callback(callback_id, "Sondaggio riaperto.")
 
     elif action == "delete":
         delete_poll_completely(raw, poll)
-        edit_message(chat_id, message_id, f"🗑️ Sondaggio #{raw} eliminato.")
+        edit_message(chat_id, message_id, "🗑️ Sondaggio eliminato.")
         answer_callback(callback_id, "Eliminato.")
-
-
-def handle_closeask_callback(callback_id, user_id, chat_id, message_id, action, poll_id):
-    if not is_channel_admin(user_id):
-        answer_callback(callback_id, "Riservato agli amministratori del canale.", alert=True)
-        return
-    poll = get_json(f"poll:{poll_id}")
-    if not poll:
-        answer_callback(callback_id, "Sondaggio non trovato.", alert=True)
-        return
-    if action == "delete":
-        delete_poll_completely(poll_id, poll)
-        edit_message(chat_id, message_id, f"🗑️ Sondaggio #{poll_id} chiuso ed eliminato.")
-    else:
-        close_poll_only(poll_id, poll)
-        edit_message(chat_id, message_id, f"🔒 Sondaggio #{poll_id} chiuso.")
-    answer_callback(callback_id)
 
 
 def handle_vote_callback(callback_id, user, poll_id, idx):
@@ -913,10 +866,24 @@ def handle_chosen_inline_result(cir: dict):
         set_json(f"poll:{poll_id}", poll)
 
 
+def ensure_commands_registered():
+    """Registra una volta sola il menu comandi di Telegram (icona accanto
+    al campo di scrittura), così l'utente ha un elenco delle funzioni
+    disponibili senza doverle ricordare a memoria."""
+    if redis.get("commands_registered"):
+        return
+    tg("setMyCommands", commands=[
+        {"command": "newpoll", "description": "📊 Crea un sondaggio"},
+        {"command": "polls", "description": "🗂 Gestisci i sondaggi"},
+    ])
+    redis.set("commands_registered", "1")
+
+
 @app.route("/api/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
     print(f"[UPDATE RICEVUTO] {json.dumps(update)}", flush=True)
+    ensure_commands_registered()
 
     if "message" in update:
         msg = update["message"]
@@ -930,12 +897,6 @@ def webhook():
             cmd_newpoll(chat_id, user_id)
         elif text.startswith("/polls"):
             cmd_polls(chat_id, user_id)
-        elif text.startswith("/close"):
-            cmd_close(chat_id, user_id, text.split()[1:])
-        elif text.startswith("/editpoll"):
-            cmd_editpoll(chat_id, user_id, text.split()[1:])
-        elif text.startswith("/log"):
-            cmd_log(chat_id, user_id, text.split()[1:])
         elif not text.startswith("/"):
             handle_option_suggestion(chat_id, user_id, text)
 
@@ -963,10 +924,6 @@ def webhook():
             _, action, item_id = data.split("|")
             handle_mgmt_callback(callback_id, user["id"], msg_ref["chat"]["id"],
                                   msg_ref["message_id"], action, item_id)
-        elif data.startswith("closeask|") and msg_ref:
-            _, action, poll_id = data.split("|")
-            handle_closeask_callback(callback_id, user["id"], msg_ref["chat"]["id"],
-                                      msg_ref["message_id"], action, poll_id)
         elif data.startswith("vote|"):
             _, poll_id, idx = data.split("|")
             handle_vote_callback(callback_id, user, poll_id, int(idx))
