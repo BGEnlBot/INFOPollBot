@@ -292,12 +292,18 @@ def build_keyboard(poll: dict):
     return {"inline_keyboard": rows}
 
 
-def build_preview_keyboard(poll_id: str):
-    """Bottoni della bozza mostrata in chat privata prima della pubblicazione."""
-    return {"inline_keyboard": [
-        [{"text": "✏️ Modifica", "web_app": {"url": edit_form_url(poll_id)}}],
-        [{"text": "🚀 Pubblica", "switch_inline_query": f"pub|{poll_id}"}],
-    ]}
+def build_preview_keyboard(poll: dict):
+    """Bottoni della bozza mostrata in chat privata prima della pubblicazione:
+    le opzioni sono visibili (per far vedere come apparirà il sondaggio) ma
+    non votabili — un tocco mostra solo un avviso, non registra nulla."""
+    poll_id = poll["id"]
+    rows = [
+        [{"text": opt, "callback_data": f"previewnoop|{poll_id}"}]
+        for opt in poll["options"]
+    ]
+    rows.append([{"text": "✏️ Modifica", "web_app": {"url": edit_form_url(poll_id)}}])
+    rows.append([{"text": "🚀 Pubblica", "switch_inline_query": f"pub|{poll_id}"}])
+    return {"inline_keyboard": rows}
 
 
 def sync_poll(poll: dict):
@@ -613,7 +619,7 @@ def handle_poll_edit(chat_id, user_id, payload):
         send_message(chat_id, "✅ Sondaggio aggiornato.")
     else:
         # È ancora una bozza non pubblicata: si torna alla preview.
-        send_message(chat_id, build_text(poll), build_preview_keyboard(poll_id), parse_mode="HTML")
+        send_message(chat_id, build_text(poll), build_preview_keyboard(poll), parse_mode="HTML")
     return True, "Sondaggio aggiornato."
 
 
@@ -704,7 +710,7 @@ def handle_web_app_data(chat_id, user_id, payload):
         return True, "Sondaggio ricorrente salvato."
     else:
         poll = create_draft(fields, chat_id)
-        send_message(chat_id, build_text(poll), build_preview_keyboard(poll["id"]), parse_mode="HTML")
+        send_message(chat_id, build_text(poll), build_preview_keyboard(poll), parse_mode="HTML")
         return True, "Bozza pronta: rivedila e pubblicala."
 
 
@@ -719,7 +725,7 @@ def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
         answer_callback(callback_id, "Modello non più disponibile.", alert=True)
         return
     poll = create_draft(extract_fields(tpl), chat_id)
-    edit_message(chat_id, message_id, build_text(poll), build_preview_keyboard(poll["id"]), parse_mode="HTML")
+    edit_message(chat_id, message_id, build_text(poll), build_preview_keyboard(poll), parse_mode="HTML")
     answer_callback(callback_id)
 
 
@@ -881,10 +887,14 @@ def handle_chosen_inline_result(cir: dict):
         return
 
     if mode == "pub":
+        # IMPORTANTE: calcolare "prima pubblicazione" PRIMA di aggiungere
+        # la nuova copia alla lista, perché .get() restituisce lo stesso
+        # oggetto lista (non una copia): appendere prima e controllare
+        # dopo farebbe risultare sempre "già pubblicato".
+        first_time = not poll.get("locations")
         locations = poll.get("locations", [])
         if inline_message_id not in locations:
             locations.append(inline_message_id)
-        first_time = not poll.get("locations")
         poll["locations"] = locations
         set_json(f"poll:{item_id}", poll)
         if first_time:
@@ -962,6 +972,8 @@ def webhook():
         elif data.startswith("vote|"):
             _, poll_id, idx = data.split("|")
             handle_vote_callback(callback_id, user, poll_id, int(idx))
+        elif data.startswith("previewnoop|"):
+            answer_callback(callback_id, "Solo un'anteprima: premi \"🚀 Pubblica\" per rendere il sondaggio votabile.")
 
     return {"ok": True}
 
