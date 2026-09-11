@@ -199,6 +199,13 @@ def next_id(counter_key: str) -> str:
     return str(redis.incr(counter_key))
 
 
+def parse_item_id(id_str: str):
+    """Interpreta un ID: 'R5' -> ('template', '5'), '5' -> ('poll', '5')."""
+    if id_str.startswith("R"):
+        return "template", id_str[1:]
+    return "poll", id_str
+
+
 def log_event(poll_id, user, event_type, old_choice, new_choice):
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -317,6 +324,39 @@ def save_template(fields: dict, weekday: int, creator_chat_id: int) -> str:
     return tpl_id
 
 
+def close_poll_only(poll_id: str, poll: dict):
+    """Chiude il sondaggio ma lo mantiene nell'elenco (riapribile)."""
+    poll["closed"] = True
+    set_json(f"poll:{poll_id}", poll)
+    sync_poll(poll)
+
+
+def reopen_poll(poll_id: str, poll: dict):
+    poll["closed"] = False
+    set_json(f"poll:{poll_id}", poll)
+    sync_poll(poll)
+
+
+def delete_poll_completely(poll_id: str, poll: dict):
+    """Chiude il sondaggio, aggiorna un'ultima volta tutte le sue copie,
+    poi lo rimuove del tutto (log dei voti inclusi, persi volutamente)."""
+    poll["closed"] = True
+    final_text = build_text(poll) + "\n\n🗑️ Sondaggio eliminato dall'amministratore."
+    tg("editMessageText", chat_id=CHANNEL_ID, message_id=poll["message_id"],
+       text=final_text, parse_mode="HTML")
+    for imid in poll.get("inline_message_ids", []):
+        tg("editMessageText", inline_message_id=imid, text=final_text, parse_mode="HTML")
+    redis.delete(f"poll:{poll_id}")
+    redis.srem("polls_index", poll_id)
+    redis.delete(f"log:{poll_id}")
+
+
+def delete_template_completely(tpl_id: str, tpl: dict):
+    redis.delete(f"template:{tpl_id}")
+    redis.srem("templates_index", tpl_id)
+    redis.srem(f"templates_by_day:{tpl['weekday']}", tpl_id)
+
+
 POLL_FIELD_KEYS = ("question", "options", "multiple", "anonymous", "quiz",
                     "allow_revote", "correct_index", "explanation",
                     "allow_suggestions", "allow_external_share")
@@ -324,6 +364,33 @@ POLL_FIELD_KEYS = ("question", "options", "multiple", "anonymous", "quiz",
 
 def extract_fields(payload: dict) -> dict:
     return {k: payload.get(k) for k in POLL_FIELD_KEYS}
+
+
+def open_edit_webapp(chat_id, id_str: str):
+    """Manda il bottone per aprire la Web App in modalità modifica,
+    sia per un sondaggio pubblicato sia per un modello ricorrente."""
+    kind, raw = parse_item_id(id_str)
+    if kind == "template":
+        tpl = get_json(f"template:{raw}")
+        if not tpl:
+            send_message(chat_id, "Sondaggio ricorrente non trovato.")
+            return
+        label = f"R{raw}"
+        form_url = request.host_url.rstrip("/") + f"/api/pollform?edit={label}"
+        keyboard = {"inline_keyboard": [[{"text": "✏️ Modifica sondaggio ricorrente", "web_app": {"url": form_url}}]]}
+        send_message(chat_id, f"Tocca il bottone per modificare il sondaggio ricorrente #{label}:", keyboard)
+        return
+
+    poll = get_json(f"poll:{raw}")
+    if not poll:
+        send_message(chat_id, "Sondaggio non trovato.")
+        return
+    if poll["closed"]:
+        send_message(chat_id, "Questo sondaggio è chiuso e non può più essere modificato.")
+        return
+    form_url = request.host_url.rstrip("/") + f"/api/pollform?edit={raw}"
+    keyboard = {"inline_keyboard": [[{"text": "✏️ Modifica sondaggio", "web_app": {"url": form_url}}]]}
+    send_message(chat_id, f"Tocca il bottone per modificare il sondaggio #{raw}:", keyboard)
 
 
 # ================= COMANDI (chat privata) =================
@@ -363,11 +430,9 @@ def cmd_start(chat_id, user_id, args):
 
     send_message(chat_id, "Ciao! Se sei amministratore del canale puoi usare:\n"
                            "/newpoll - crea un sondaggio (si apre una schermata dedicata)\n"
-                           "/editpoll ID - modifica domanda/opzioni di un sondaggio aperto\n"
-                           "/polls - elenco sondaggi pubblicati\n"
-                           "/recurrents - elenco sondaggi ricorrenti\n"
-                           "/close ID - chiude un sondaggio\n"
-                           "/delrecurrent ID - elimina un modello ricorrente\n"
+                           "/editpoll ID - modifica domanda/opzioni (funziona anche per i ricorrenti, es. R3)\n"
+                           "/polls - elenco sondaggi e ricorrenti, con azioni rapide\n"
+                           "/close ID - chiude un sondaggio (chiedendo se eliminarlo)\n"
                            "/log ID - riepilogo voti di un sondaggio",
                  reply_markup={"remove_keyboard": True})
 
@@ -416,71 +481,53 @@ def cmd_editpoll(chat_id, user_id, args):
         send_message(chat_id, "Comando riservato agli amministratori del canale.")
         return
     if not args:
-        send_message(chat_id, "Uso: /editpoll ID  (vedi /polls per gli ID)")
-        return
-    poll_id = args[0]
-    poll = get_json(f"poll:{poll_id}")
-    if not poll:
-        send_message(chat_id, "Sondaggio non trovato.")
-        return
-    if poll["closed"]:
-        send_message(chat_id, "Questo sondaggio è chiuso e non può più essere modificato.")
+        send_message(chat_id, "Uso: /editpoll ID  (vedi /polls per gli ID; per i ricorrenti usa es. R3)")
         return
     remember_admin_chat(user_id, chat_id)
-    form_url = request.host_url.rstrip("/") + f"/api/pollform?edit={poll_id}"
-    keyboard = {"inline_keyboard": [[{"text": "✏️ Modifica sondaggio", "web_app": {"url": form_url}}]]}
-    send_message(chat_id, f"Tocca il bottone per modificare il sondaggio #{poll_id}:", keyboard)
+    open_edit_webapp(chat_id, args[0])
 
 
 def cmd_polls(chat_id, user_id):
     if not is_channel_admin(user_id):
         send_message(chat_id, "Comando riservato agli amministratori del canale.")
         return
-    ids = redis.smembers("polls_index") or []
-    if not ids:
+
+    poll_ids = sorted(redis.smembers("polls_index") or [], key=int)
+    tpl_ids = sorted(redis.smembers("templates_index") or [], key=int)
+
+    if not poll_ids and not tpl_ids:
         send_message(chat_id, "Nessun sondaggio creato ancora.")
         return
-    lines = []
-    for pid in sorted(ids, key=int):
+
+    for pid in poll_ids:
         p = get_json(f"poll:{pid}")
-        if p:
-            stato = "chiuso" if p["closed"] else "attivo"
-            lines.append(f"#{pid} [{stato}] {p['question']}")
-    send_message(chat_id, "\n".join(lines))
+        if not p:
+            continue
+        if p["closed"]:
+            text = f"#{pid} [chiuso] {p['question']}"
+            keyboard = {"inline_keyboard": [[
+                {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{pid}"},
+                {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{pid}"},
+            ]]}
+        else:
+            text = f"#{pid} [attivo] {p['question']}"
+            keyboard = {"inline_keyboard": [[
+                {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{pid}"},
+                {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
+            ]]}
+        send_message(chat_id, text, keyboard)
 
-
-def cmd_recurrents(chat_id, user_id):
-    if not is_channel_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del canale.")
-        return
-    ids = redis.smembers("templates_index") or []
-    if not ids:
-        send_message(chat_id, "Nessun sondaggio ricorrente impostato.")
-        return
-    lines = []
-    for tid in sorted(ids, key=int):
+    for tid in tpl_ids:
         t = get_json(f"template:{tid}")
-        if t:
-            lines.append(f"#{tid} [{WEEKDAY_NAMES[t['weekday']]}] {t['question']}")
-    send_message(chat_id, "\n".join(lines))
-
-
-def cmd_delrecurrent(chat_id, user_id, args):
-    if not is_channel_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del canale.")
-        return
-    if not args:
-        send_message(chat_id, "Uso: /delrecurrent ID  (vedi /recurrents per gli ID)")
-        return
-    tid = args[0]
-    t = get_json(f"template:{tid}")
-    if not t:
-        send_message(chat_id, "Modello ricorrente non trovato.")
-        return
-    redis.srem("templates_index", tid)
-    redis.srem(f"templates_by_day:{t['weekday']}", tid)
-    redis.delete(f"template:{tid}")
-    send_message(chat_id, f"Modello ricorrente #{tid} eliminato.")
+        if not t:
+            continue
+        rid = f"R{tid}"
+        text = f"#{rid} [ricorrente, {WEEKDAY_NAMES[t['weekday']]}] {t['question']}"
+        keyboard = {"inline_keyboard": [[
+            {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{rid}"},
+            {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{rid}"},
+        ]]}
+        send_message(chat_id, text, keyboard)
 
 
 def cmd_close(chat_id, user_id, args):
@@ -495,10 +542,16 @@ def cmd_close(chat_id, user_id, args):
     if not poll:
         send_message(chat_id, "Sondaggio non trovato.")
         return
-    poll["closed"] = True
-    set_json(f"poll:{poll_id}", poll)
-    sync_poll(poll)
-    send_message(chat_id, f"Sondaggio #{poll_id} chiuso.")
+    if poll["closed"]:
+        send_message(chat_id, "Questo sondaggio è già chiuso.")
+        return
+    keyboard = {"inline_keyboard": [[
+        {"text": "🔒 Solo chiudi", "callback_data": f"closeask|keep|{poll_id}"},
+        {"text": "🗑️ Chiudi ed elimina", "callback_data": f"closeask|delete|{poll_id}"},
+    ]]}
+    send_message(chat_id, f"Vuoi chiudere il sondaggio #{poll_id}?\n\n"
+                           "Se lo elimini, sparirà anche dall'elenco (/polls) e i log dei voti andranno persi.",
+                 keyboard)
 
 
 def cmd_log(chat_id, user_id, args):
@@ -594,11 +647,58 @@ def handle_poll_edit(chat_id, user_id, payload):
     return True, "Sondaggio aggiornato."
 
 
+def handle_template_edit(chat_id, user_id, payload):
+    tpl_id = payload["edit_poll_id"][1:]  # toglie il prefisso "R"
+    tpl = get_json(f"template:{tpl_id}")
+    if not tpl:
+        send_message(chat_id, "Sondaggio ricorrente non trovato.")
+        return False, "Sondaggio ricorrente non trovato."
+
+    question = (payload.get("question") or "").strip()
+    new_options = [o.strip() for o in payload.get("options", []) if o.strip()]
+    if not question:
+        send_message(chat_id, "La domanda non può essere vuota. Modifica annullata.")
+        return False, "La domanda non può essere vuota."
+    if not (2 <= len(new_options) <= 10):
+        send_message(chat_id, "Servono tra 2 e 10 opzioni. Modifica annullata.")
+        return False, "Servono tra 2 e 10 opzioni."
+
+    weekday = payload.get("weekday")
+    if weekday is None or not (0 <= int(weekday) <= 6):
+        send_message(chat_id, "Giorno della settimana non valido. Modifica annullata.")
+        return False, "Giorno della settimana non valido."
+    weekday = int(weekday)
+
+    old_weekday = tpl["weekday"]
+    tpl["question"] = question
+    tpl["options"] = new_options
+    tpl["multiple"] = bool(payload.get("multiple"))
+    tpl["anonymous"] = bool(payload.get("anonymous"))
+    tpl["quiz"] = bool(payload.get("quiz"))
+    tpl["allow_revote"] = bool(payload.get("allow_revote", True))
+    tpl["correct_index"] = payload.get("correct_index")
+    tpl["explanation"] = (payload.get("explanation") or "").strip()
+    tpl["allow_suggestions"] = bool(payload.get("allow_suggestions"))
+    tpl["allow_external_share"] = bool(payload.get("allow_external_share"))
+    tpl["weekday"] = weekday
+
+    set_json(f"template:{tpl_id}", tpl)
+    if weekday != old_weekday:
+        redis.srem(f"templates_by_day:{old_weekday}", tpl_id)
+        redis.sadd(f"templates_by_day:{weekday}", tpl_id)
+
+    send_message(chat_id, f"✅ Sondaggio ricorrente aggiornato (ogni {WEEKDAY_NAMES[weekday]}).")
+    return True, "Sondaggio ricorrente aggiornato."
+
+
 def handle_web_app_data(chat_id, user_id, payload):
     if not is_channel_admin(user_id):
         return False, "Comando riservato agli amministratori del canale."
 
-    if payload.get("edit_poll_id"):
+    edit_id = payload.get("edit_poll_id")
+    if edit_id:
+        if edit_id.startswith("R"):
+            return handle_template_edit(chat_id, user_id, payload)
         return handle_poll_edit(chat_id, user_id, payload)
 
     question = (payload.get("question") or "").strip()
@@ -655,7 +755,78 @@ def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
         edit_message(chat_id, message_id, f"❌ Telegram ha rifiutato la pubblicazione: {err}")
         answer_callback(callback_id, "Errore nella pubblicazione.", alert=True)
         return
-    edit_message(chat_id, message_id, f"✅ Sondaggio pubblicato nel canale (dal modello #{tpl_id}).")
+    edit_message(chat_id, message_id, f"✅ Sondaggio pubblicato nel canale (dal modello #R{tpl_id}).")
+    answer_callback(callback_id)
+
+
+def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item_id):
+    if not is_channel_admin(user_id):
+        answer_callback(callback_id, "Riservato agli amministratori del canale.", alert=True)
+        return
+
+    kind, raw = parse_item_id(item_id)
+
+    if kind == "template":
+        tpl = get_json(f"template:{raw}")
+        if not tpl:
+            answer_callback(callback_id, "Modello non trovato.", alert=True)
+            return
+        if action == "edit":
+            open_edit_webapp(chat_id, item_id)
+            answer_callback(callback_id)
+        elif action == "delete":
+            delete_template_completely(raw, tpl)
+            edit_message(chat_id, message_id, f"🗑️ Sondaggio ricorrente #{item_id} eliminato.")
+            answer_callback(callback_id, "Eliminato.")
+        else:
+            answer_callback(callback_id, "Azione non disponibile per un sondaggio ricorrente.", alert=True)
+        return
+
+    poll = get_json(f"poll:{raw}")
+    if not poll:
+        answer_callback(callback_id, "Sondaggio non trovato.", alert=True)
+        return
+
+    if action == "edit":
+        open_edit_webapp(chat_id, item_id)
+        answer_callback(callback_id)
+
+    elif action == "close":
+        close_poll_only(raw, poll)
+        edit_message(chat_id, message_id, f"#{raw} [chiuso] {poll['question']}", {"inline_keyboard": [[
+            {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{raw}"},
+            {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{raw}"},
+        ]]})
+        answer_callback(callback_id, "Sondaggio chiuso.")
+
+    elif action == "reopen":
+        reopen_poll(raw, poll)
+        edit_message(chat_id, message_id, f"#{raw} [attivo] {poll['question']}", {"inline_keyboard": [[
+            {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{raw}"},
+            {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
+        ]]})
+        answer_callback(callback_id, "Sondaggio riaperto.")
+
+    elif action == "delete":
+        delete_poll_completely(raw, poll)
+        edit_message(chat_id, message_id, f"🗑️ Sondaggio #{raw} eliminato.")
+        answer_callback(callback_id, "Eliminato.")
+
+
+def handle_closeask_callback(callback_id, user_id, chat_id, message_id, action, poll_id):
+    if not is_channel_admin(user_id):
+        answer_callback(callback_id, "Riservato agli amministratori del canale.", alert=True)
+        return
+    poll = get_json(f"poll:{poll_id}")
+    if not poll:
+        answer_callback(callback_id, "Sondaggio non trovato.", alert=True)
+        return
+    if action == "delete":
+        delete_poll_completely(poll_id, poll)
+        edit_message(chat_id, message_id, f"🗑️ Sondaggio #{poll_id} chiuso ed eliminato.")
+    else:
+        close_poll_only(poll_id, poll)
+        edit_message(chat_id, message_id, f"🔒 Sondaggio #{poll_id} chiuso.")
     answer_callback(callback_id)
 
 
@@ -759,10 +930,6 @@ def webhook():
             cmd_newpoll(chat_id, user_id)
         elif text.startswith("/polls"):
             cmd_polls(chat_id, user_id)
-        elif text.startswith("/recurrents"):
-            cmd_recurrents(chat_id, user_id)
-        elif text.startswith("/delrecurrent"):
-            cmd_delrecurrent(chat_id, user_id, text.split()[1:])
         elif text.startswith("/close"):
             cmd_close(chat_id, user_id, text.split()[1:])
         elif text.startswith("/editpoll"):
@@ -792,6 +959,14 @@ def webhook():
         if data.startswith("recur|") and msg_ref:
             handle_recur_callback(callback_id, user["id"], msg_ref["chat"]["id"],
                                    msg_ref["message_id"], data.split("|")[1])
+        elif data.startswith("mgmt|") and msg_ref:
+            _, action, item_id = data.split("|")
+            handle_mgmt_callback(callback_id, user["id"], msg_ref["chat"]["id"],
+                                  msg_ref["message_id"], action, item_id)
+        elif data.startswith("closeask|") and msg_ref:
+            _, action, poll_id = data.split("|")
+            handle_closeask_callback(callback_id, user["id"], msg_ref["chat"]["id"],
+                                      msg_ref["message_id"], action, poll_id)
         elif data.startswith("vote|"):
             _, poll_id, idx = data.split("|")
             handle_vote_callback(callback_id, user, poll_id, int(idx))
@@ -933,7 +1108,7 @@ POLLFORM_HTML = """<!DOCTYPE html>
 </div>
 
 <div class="card" id="recurrentCard">
-  <div class="setting-row">
+  <div class="setting-row" id="recurrentToggleRow">
     <div class="setting-text"><b>Sondaggio ricorrente</b><span>Ricevi un promemoria settimanale per ripubblicarlo</span></div>
     <label class="switch"><input type="checkbox" id="recurrent"><span class="slider"></span></label>
   </div>
@@ -1002,10 +1177,9 @@ addOption(''); addOption('');
 // ---- Modalità modifica: se la Web App è aperta con ?edit=ID, precompila ----
 const urlParams = new URLSearchParams(location.search);
 const editId = urlParams.get('edit');
+const isTemplateEdit = !!(editId && editId.startsWith('R'));
 
 if (editId) {
-  document.querySelector('.topbar h1').textContent = 'Modifica sondaggio';
-  document.getElementById('recurrentCard').style.display = 'none';
   document.getElementById('createBtn').textContent = 'Salva';
 
   // rimuove le due righe opzione vuote create di default, verranno ripopolate
@@ -1016,11 +1190,22 @@ if (editId) {
     .then(r => r.json())
     .then(data => {
       if (!data.ok) {
-        alert('Sondaggio non trovato o già chiuso: impossibile modificarlo.');
+        alert('Sondaggio non trovato o non più modificabile.');
         tg.close();
         return;
       }
       const p = data.poll;
+
+      if (data.is_template) {
+        document.querySelector('.topbar h1').textContent = 'Modifica sondaggio ricorrente';
+        document.getElementById('recurrentToggleRow').style.display = 'none';
+        document.getElementById('weekdayRow').style.display = 'flex';
+        document.getElementById('weekday').value = String(p.weekday);
+      } else {
+        document.querySelector('.topbar h1').textContent = 'Modifica sondaggio';
+        document.getElementById('recurrentCard').style.display = 'none';
+      }
+
       document.getElementById('question').value = p.question || '';
       (p.options || []).forEach(o => addOption(o));
       document.getElementById('showVoters').checked = !p.anonymous;
@@ -1119,8 +1304,10 @@ document.getElementById('createBtn').addEventListener('click', () => {
     explanation: document.getElementById('explanation').value.trim(),
     allow_suggestions: document.getElementById('allowSuggestions').checked,
     allow_external_share: document.getElementById('allowExternalShare').checked,
-    recurrent: editId ? false : recurrentToggle.checked,
-    weekday: (!editId && recurrentToggle.checked) ? parseInt(document.getElementById('weekday').value, 10) : null,
+    recurrent: (!editId) ? recurrentToggle.checked : false,
+    weekday: isTemplateEdit
+      ? parseInt(document.getElementById('weekday').value, 10)
+      : ((!editId && recurrentToggle.checked) ? parseInt(document.getElementById('weekday').value, 10) : null),
   };
 
   fetch('/api/submitpoll', {
@@ -1173,11 +1360,31 @@ def pollform():
 
 @app.route("/api/pollformdata", methods=["GET"])
 def pollformdata():
-    poll_id = request.args.get("id", "")
-    poll = get_json(f"poll:{poll_id}")
+    id_str = request.args.get("id", "")
+    kind, raw = parse_item_id(id_str)
+
+    if kind == "template":
+        tpl = get_json(f"template:{raw}")
+        if not tpl:
+            return {"ok": False}, 404
+        return {"ok": True, "is_template": True, "poll": {
+            "question": tpl["question"],
+            "options": tpl["options"],
+            "multiple": tpl["multiple"],
+            "anonymous": tpl["anonymous"],
+            "quiz": tpl["quiz"],
+            "allow_revote": tpl["allow_revote"],
+            "correct_index": tpl["correct_index"],
+            "explanation": tpl.get("explanation", ""),
+            "allow_suggestions": tpl.get("allow_suggestions", False),
+            "allow_external_share": tpl.get("allow_external_share", False),
+            "weekday": tpl["weekday"],
+        }}
+
+    poll = get_json(f"poll:{raw}")
     if not poll or poll.get("closed"):
         return {"ok": False}, 404
-    return {"ok": True, "poll": {
+    return {"ok": True, "is_template": False, "poll": {
         "question": poll["question"],
         "options": poll["options"],
         "multiple": poll["multiple"],
