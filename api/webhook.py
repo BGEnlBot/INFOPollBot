@@ -1,32 +1,46 @@
 """
-Bot Telegram per sondaggi - versione WEBHOOK per Vercel, con:
-  - Log cronologico di voti e cambi voto (/log ID)
-  - Sondaggi RICORRENTI: crei un modello una volta sola, scegli il
-    giorno della settimana, e ogni settimana in quel giorno ricevi un
-    promemoria con un bottone "Crea sondaggio ora" che lo pubblica nel
-    canale identico a come l'hai impostato la prima volta.
+Bot Telegram per sondaggi - versione WEBHOOK per Vercel, con interfaccia
+di creazione basata su TELEGRAM WEB APP (Mini App), non più su messaggi
+di testo a step rigidi.
+
+COME FUNZIONA L'INTERFACCIA:
+  - /newpoll manda in chat privata un bottone "📊 Crea sondaggio"
+  - Il bottone apre una pagina HTML DENTRO Telegram (Web App), con lo
+    stesso stile del tema dell'utente (chiaro/scuro), dove si scrive
+    liberamente domanda + opzioni + impostazioni, tutto su una sola
+    schermata modificabile in qualsiasi ordine (come il sondaggio
+    nativo di Telegram)
+  - Nella domanda si possono inserire link cliccabili con il pulsante
+    "🔗 Inserisci link" (testo + URL, anche Google Maps)
+  - Alla pressione di "Crea", la Web App manda i dati al bot
+    (Telegram.WebApp.sendData) che pubblica il sondaggio nel canale
 
 ARCHITETTURA:
   - Nessun polling: Telegram chiama /api/webhook ad ogni evento
   - Nessun file locale: tutti i dati vivono su Upstash Redis
-  - Il promemoria settimanale è innescato da un Vercel Cron Job che
-    chiama /api/cron una volta al giorno (il piano gratuito di Vercel
-    permette al massimo un cron al giorno, va benissimo per questo caso)
+  - La pagina della Web App è servita da /api/pollform (stesso progetto)
+  - Il promemoria settimanale (sondaggi ricorrenti) è innescato da un
+    Vercel Cron Job che chiama /api/cron una volta al giorno
 
 VARIABILI D'AMBIENTE (Vercel -> Project Settings -> Environment Variables):
     TELEGRAM_TOKEN              token del bot, da @BotFather
-    CHANNEL_ID                  es. "@nomecanale" oppure ID numerico
+    CHANNEL_ID                  ID del CANALE (es. "@nomecanale" o -100...)
     UPSTASH_REDIS_REST_URL      da dashboard Upstash
     UPSTASH_REDIS_REST_TOKEN    da dashboard Upstash
-    CRON_SECRET                 generato automaticamente da Vercel quando
-                                 aggiungi un cron in vercel.json
+    CRON_SECRET                 generato automaticamente da Vercel
 
-DOPO IL DEPLOY, imposta il webhook (una volta sola), visitando nel browser:
+DOPO IL DEPLOY, imposta il webhook (una volta sola):
     https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<tuo-progetto>.vercel.app/api/webhook
+
+NOTA IMPORTANTE: la Web App di Telegram richiede HTTPS con certificato
+valido (Vercel lo fornisce sempre di default, nessuna azione richiesta)
+e funziona solo se aperta da una chat PRIVATA con il bot (non nei canali).
 """
 
+import html
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 import requests
@@ -39,9 +53,38 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 WEEKDAY_NAMES = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
+LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 
 redis = Redis.from_env()
 app = Flask(__name__)
+
+
+# ================= HELPER TESTO / HTML =================
+
+def esc(s) -> str:
+    """Escape per testo semplice dentro un messaggio Telegram in parse_mode HTML."""
+    return html.escape(str(s), quote=False)
+
+
+def esc_attr(s) -> str:
+    """Escape per un valore dentro un attributo HTML (es. href)."""
+    return html.escape(str(s), quote=True)
+
+
+def format_rich_text(raw: str) -> str:
+    """
+    Converte i link scritti come [testo](url) (inseriti dalla Web App)
+    in veri hyperlink HTML Telegram, mantenendo il resto del testo
+    correttamente sfuggito. Usato solo per la domanda del sondaggio.
+    """
+    out, last = [], 0
+    for m in LINK_PATTERN.finditer(raw):
+        out.append(esc(raw[last:m.start()]))
+        label, url = m.group(1), m.group(2)
+        out.append(f'<a href="{esc_attr(url)}">{esc(label)}</a>')
+        last = m.end()
+    out.append(esc(raw[last:]))
+    return "".join(out)
 
 
 # ================= HELPER TELEGRAM =================
@@ -55,13 +98,14 @@ def tg(method: str, **params):
     return result
 
 
-def send_message(chat_id, text, reply_markup=None):
-    return tg("sendMessage", chat_id=chat_id, text=text, reply_markup=reply_markup)
+def send_message(chat_id, text, reply_markup=None, parse_mode=None):
+    return tg("sendMessage", chat_id=chat_id, text=text,
+              reply_markup=reply_markup, parse_mode=parse_mode)
 
 
-def edit_message(chat_id, message_id, text, reply_markup=None):
+def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode=None):
     return tg("editMessageText", chat_id=chat_id, message_id=message_id,
-               text=text, reply_markup=reply_markup)
+               text=text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 
 def edit_markup(chat_id, message_id, reply_markup):
@@ -71,6 +115,17 @@ def edit_markup(chat_id, message_id, reply_markup):
 
 def answer_callback(callback_id, text=None, alert=False):
     tg("answerCallbackQuery", callback_query_id=callback_id, text=text, show_alert=alert)
+
+
+def get_bot_username() -> str:
+    cached = redis.get("bot_username")
+    if cached:
+        return cached
+    res = tg("getMe")
+    username = res.get("result", {}).get("username", "")
+    if username:
+        redis.set("bot_username", username)
+    return username
 
 
 def is_channel_admin(user_id: int) -> bool:
@@ -108,7 +163,6 @@ def log_event(poll_id, user, event_type, old_choice, new_choice):
 
 
 def remember_admin_chat(user_id: int, chat_id: int):
-    """Tiene traccia di quali chat private usare per inviare i promemoria settimanali."""
     if is_channel_admin(user_id):
         redis.sadd("admin_chats", f"{user_id}:{chat_id}")
 
@@ -116,14 +170,15 @@ def remember_admin_chat(user_id: int, chat_id: int):
 # ================= COSTRUZIONE SONDAGGIO =================
 
 def build_text(poll: dict) -> str:
+    """Genera il testo del messaggio in HTML (Telegram parse_mode=HTML)."""
     icon = "🧠" if poll["quiz"] else "📊"
-    lines = [f"{icon} {poll['question']}", ""]
+    lines = [f"{icon} {format_rich_text(poll['question'])}", ""]
     for i, opt in enumerate(poll["options"]):
         voters = [v["name"] for v in poll["votes"].values() if i in v["choices"]]
         mark = "✅ " if poll["quiz"] and i == poll["correct_index"] and poll["closed"] else ""
-        lines.append(f"▫️ {mark}{opt} — {len(voters)} voti")
+        lines.append(f"▫️ {mark}{esc(opt)} — {len(voters)} voti")
         if voters and not poll["anonymous"]:
-            lines.append("   " + ", ".join(voters))
+            lines.append("   " + esc(", ".join(voters)))
     lines.append("")
     tags = ["anonimo" if poll["anonymous"] else "voti pubblici",
             "risposte multiple" if poll["multiple"] else "risposta singola"]
@@ -136,67 +191,38 @@ def build_text(poll: dict) -> str:
         lines.append("")
         lines.append("🔒 Sondaggio chiuso.")
         if poll["quiz"] and poll.get("explanation"):
-            lines.append(f"ℹ️ {poll['explanation']}")
+            lines.append(f"ℹ️ {esc(poll['explanation'])}")
     return "\n".join(lines)
 
 
 def build_keyboard(poll: dict):
     if poll["closed"]:
         return None
-    return {"inline_keyboard": [
+    rows = [
         [{"text": opt, "callback_data": f"vote|{poll['id']}|{i}"}]
         for i, opt in enumerate(poll["options"])
-    ]}
-
-
-def settings_keyboard(draft: dict):
-    def flag(label, key):
-        return f"✅ {label}" if draft.get(key) else f"⬜ {label}"
-
-    publish_label = "📅 Scegli il giorno del promemoria" if draft.get("mode") == "recurrent" else "🚀 Pubblica nel canale"
-    return {"inline_keyboard": [
-        [{"text": flag("Risposte multiple", "multiple"), "callback_data": "cfg|multiple"}],
-        [{"text": flag("Sondaggio anonimo", "anonymous"), "callback_data": "cfg|anonymous"}],
-        [{"text": flag("Modalità quiz", "quiz"), "callback_data": "cfg|quiz"}],
-        [{"text": flag("Consenti cambio voto", "allow_revote"), "callback_data": "cfg|allow_revote"}],
-        [{"text": publish_label, "callback_data": "cfg|publish"}],
-        [{"text": "❌ Annulla", "callback_data": "cfg|cancel"}],
-    ]}
-
-
-def weekday_keyboard():
-    rows = [[{"text": name, "callback_data": f"day|{i}"}] for i, name in enumerate(WEEKDAY_NAMES)]
-    rows.append([{"text": "❌ Annulla", "callback_data": "cfg|cancel"}])
+    ]
+    if poll.get("allow_suggestions") and len(poll["options"]) < 10:
+        username = get_bot_username()
+        if username:
+            rows.append([{"text": "➕ Proponi un'opzione", "url": f"https://t.me/{username}?start=addopt_{poll['id']}"}])
     return {"inline_keyboard": rows}
-
-
-def poll_fields_from(draft: dict) -> dict:
-    return {
-        "question": draft["question"],
-        "options": draft["options"],
-        "multiple": draft.get("multiple", False),
-        "anonymous": draft.get("anonymous", False),
-        "quiz": draft.get("quiz", False),
-        "allow_revote": draft.get("allow_revote", True),
-        "correct_index": draft.get("correct_index"),
-        "explanation": draft.get("explanation", ""),
-    }
 
 
 def publish_poll(fields: dict) -> dict:
     poll_id = next_id("poll_counter")
     poll = dict(fields)
     poll.update({"id": poll_id, "closed": False, "votes": {}})
-    res = send_message(CHANNEL_ID, build_text(poll), build_keyboard(poll))
+    res = send_message(CHANNEL_ID, build_text(poll), build_keyboard(poll), parse_mode="HTML")
     poll["message_id"] = res["result"]["message_id"]
     set_json(f"poll:{poll_id}", poll)
     redis.sadd("polls_index", poll_id)
     return poll
 
 
-def save_template(draft: dict, weekday: int, creator_chat_id: int) -> str:
+def save_template(fields: dict, weekday: int, creator_chat_id: int) -> str:
     tpl_id = next_id("template_counter")
-    tpl = poll_fields_from(draft)
+    tpl = dict(fields)
     tpl.update({"id": tpl_id, "weekday": weekday, "creator_chat_id": creator_chat_id})
     set_json(f"template:{tpl_id}", tpl)
     redis.sadd("templates_index", tpl_id)
@@ -204,28 +230,86 @@ def save_template(draft: dict, weekday: int, creator_chat_id: int) -> str:
     return tpl_id
 
 
+POLL_FIELD_KEYS = ("question", "options", "multiple", "anonymous", "quiz",
+                    "allow_revote", "correct_index", "explanation", "allow_suggestions")
+
+
+def extract_fields(payload: dict) -> dict:
+    return {k: payload.get(k) for k in POLL_FIELD_KEYS}
+
+
 # ================= COMANDI (chat privata) =================
 
-def cmd_start(chat_id, user_id):
+def cmd_start(chat_id, user_id, args):
     remember_admin_chat(user_id, chat_id)
+
+    if args and args[0].startswith("addopt_"):
+        poll_id = args[0][len("addopt_"):]
+        poll = get_json(f"poll:{poll_id}")
+        if not poll or poll["closed"]:
+            send_message(chat_id, "Questo sondaggio non è più disponibile.")
+            return
+        if not poll.get("allow_suggestions"):
+            send_message(chat_id, "Questo sondaggio non accetta opzioni proposte dagli utenti.")
+            return
+        if len(poll["options"]) >= 10:
+            send_message(chat_id, "Questo sondaggio ha già raggiunto il numero massimo di opzioni.")
+            return
+        redis.set(f"awaiting_option:{user_id}", poll_id)
+        send_message(chat_id, f"Scrivi il testo della nuova opzione da proporre per:\n\n"
+                               f"«{poll['question']}»")
+        return
+
     send_message(chat_id, "Ciao! Se sei amministratore del canale puoi usare:\n"
-                           "/newpoll - crea un sondaggio da pubblicare subito\n"
-                           "/newrecurrent - crea un sondaggio ricorrente con promemoria settimanale\n"
+                           "/newpoll - crea un sondaggio (si apre una schermata dedicata)\n"
                            "/polls - elenco sondaggi pubblicati\n"
-                           "/recurrents - elenco modelli ricorrenti\n"
+                           "/recurrents - elenco sondaggi ricorrenti\n"
                            "/close ID - chiude un sondaggio\n"
                            "/delrecurrent ID - elimina un modello ricorrente\n"
                            "/log ID - riepilogo voti di un sondaggio")
 
 
-def cmd_newpoll(chat_id, user_id, mode="immediate"):
+def handle_option_suggestion(chat_id, user_id, text):
+    poll_id = redis.get(f"awaiting_option:{user_id}")
+    if not poll_id:
+        return False
+
+    redis.delete(f"awaiting_option:{user_id}")
+    option = text.strip()
+    if not option:
+        send_message(chat_id, "Opzione vuota, non è stata aggiunta.")
+        return True
+
+    poll = get_json(f"poll:{poll_id}")
+    if not poll or poll["closed"] or not poll.get("allow_suggestions"):
+        send_message(chat_id, "Questo sondaggio non è più disponibile per nuove proposte.")
+        return True
+    if len(poll["options"]) >= 10:
+        send_message(chat_id, "Il sondaggio ha già raggiunto il numero massimo di opzioni.")
+        return True
+    if any(o.strip().lower() == option.lower() for o in poll["options"]):
+        send_message(chat_id, "Questa opzione è già presente nel sondaggio.")
+        return True
+
+    poll["options"].append(option)
+    set_json(f"poll:{poll_id}", poll)
+    edit_message(CHANNEL_ID, poll["message_id"], build_text(poll), build_keyboard(poll), parse_mode="HTML")
+    send_message(chat_id, f"✅ Opzione aggiunta al sondaggio: «{option}»")
+    return True
+
+
+def cmd_newpoll(chat_id, user_id):
     if not is_channel_admin(user_id):
         send_message(chat_id, "Comando riservato agli amministratori del canale.")
         return
     remember_admin_chat(user_id, chat_id)
-    set_json(f"draft:{user_id}", {"step": "question", "options": [], "mode": mode})
-    intro = "Creiamo un nuovo sondaggio ricorrente." if mode == "recurrent" else "Creiamo un nuovo sondaggio."
-    send_message(chat_id, f"{intro}\n\nScrivi la domanda:")
+    form_url = request.host_url.rstrip("/") + "/api/pollform"
+    keyboard = {
+        "keyboard": [[{"text": "📊 Crea sondaggio", "web_app": {"url": form_url}}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+    send_message(chat_id, "Tocca il bottone per aprire la creazione del sondaggio:", keyboard)
 
 
 def cmd_polls(chat_id, user_id):
@@ -293,7 +377,7 @@ def cmd_close(chat_id, user_id, args):
         return
     poll["closed"] = True
     set_json(f"poll:{poll_id}", poll)
-    edit_message(CHANNEL_ID, poll["message_id"], build_text(poll), build_keyboard(poll))
+    edit_message(CHANNEL_ID, poll["message_id"], build_text(poll), build_keyboard(poll), parse_mode="HTML")
     send_message(chat_id, f"Sondaggio #{poll_id} chiuso.")
 
 
@@ -325,139 +409,56 @@ def cmd_log(chat_id, user_id, args):
     send_message(chat_id, "\n".join(lines).strip())
 
 
-def cmd_cancel(chat_id, user_id):
-    redis.delete(f"draft:{user_id}")
-    send_message(chat_id, "Creazione annullata.")
+# ================= RICEZIONE DATI DALLA WEB APP =================
 
+def handle_web_app_data(chat_id, user_id, raw_data):
+    if not is_channel_admin(user_id):
+        send_message(chat_id, "Comando riservato agli amministratori del canale.")
+        return
 
-# ================= FLUSSO CREAZIONE (messaggi di testo) =================
+    try:
+        payload = json.loads(raw_data)
+    except (ValueError, TypeError):
+        send_message(chat_id, "Dati del sondaggio non validi, riprova con /newpoll.")
+        return
 
-def handle_draft_message(chat_id, user_id, text):
-    draft = get_json(f"draft:{user_id}")
-    if not draft:
-        return False
+    question = (payload.get("question") or "").strip()
+    options = [o.strip() for o in payload.get("options", []) if o.strip()]
 
-    step = draft["step"]
+    if not question:
+        send_message(chat_id, "La domanda non può essere vuota. Riprova con /newpoll.")
+        return
+    if not (2 <= len(options) <= 10):
+        send_message(chat_id, "Servono tra 2 e 10 opzioni. Riprova con /newpoll.")
+        return
 
-    if step == "question":
-        draft["question"] = text
-        draft["step"] = "options"
-        set_json(f"draft:{user_id}", draft)
-        send_message(chat_id, "Ora invia le opzioni di risposta, UNA PER RIGA "
-                               "(minimo 2, massimo 10), tutte in un unico messaggio.")
-        return True
+    fields = {
+        "question": question,
+        "options": options,
+        "multiple": bool(payload.get("multiple")),
+        "anonymous": bool(payload.get("anonymous")),
+        "quiz": bool(payload.get("quiz")),
+        "allow_revote": bool(payload.get("allow_revote", True)),
+        "correct_index": payload.get("correct_index"),
+        "explanation": (payload.get("explanation") or "").strip(),
+        "allow_suggestions": bool(payload.get("allow_suggestions")),
+    }
 
-    if step == "options":
-        options = [line.strip() for line in text.splitlines() if line.strip()]
-        if not (2 <= len(options) <= 10):
-            send_message(chat_id, "Servono tra 2 e 10 opzioni, una per riga. Riprova.")
-            return True
-        draft["options"] = options
-        draft["step"] = "settings"
-        set_json(f"draft:{user_id}", draft)
-        opts_text = "\n".join(f"{i + 1}. {o}" for i, o in enumerate(options))
-        send_message(chat_id, f"Domanda: {draft['question']}\n\nOpzioni:\n{opts_text}\n\n"
-                               "Imposta le opzioni del sondaggio:", settings_keyboard(draft))
-        return True
-
-    if step == "correct":
-        try:
-            idx = int(text.strip()) - 1
-            assert 0 <= idx < len(draft["options"])
-        except (ValueError, AssertionError):
-            send_message(chat_id, "Numero non valido, riprova.")
-            return True
-        draft["correct_index"] = idx
-        draft["step"] = "explanation"
-        set_json(f"draft:{user_id}", draft)
-        send_message(chat_id, "Vuoi aggiungere una spiegazione mostrata a chiusura sondaggio? "
-                               "Scrivila, oppure invia /skip per saltare.")
-        return True
-
-    if step == "explanation":
-        if text.strip() != "/skip":
-            draft["explanation"] = text
-        finalize_draft(chat_id, user_id, draft)
-        return True
-
-    return False
-
-
-def finalize_draft(chat_id, user_id, draft):
-    """Dopo settings/quiz: pubblica subito (immediate) oppure chiede il giorno (recurrent)."""
-    if draft.get("mode") == "recurrent":
-        draft["step"] = "weekday"
-        set_json(f"draft:{user_id}", draft)
-        send_message(chat_id, "In quale giorno della settimana vuoi ricevere il promemoria "
-                               "per pubblicare questo sondaggio?", weekday_keyboard())
+    if payload.get("recurrent"):
+        weekday = payload.get("weekday")
+        if weekday is None or not (0 <= int(weekday) <= 6):
+            send_message(chat_id, "Giorno della settimana non valido. Riprova con /newpoll.")
+            return
+        tpl_id = save_template(fields, int(weekday), chat_id)
+        send_message(chat_id, f"✅ Sondaggio ricorrente salvato (#{tpl_id}).\n"
+                               f"Ogni {WEEKDAY_NAMES[int(weekday)]} riceverai un promemoria "
+                               f"con un bottone per pubblicarlo nel canale.")
     else:
-        publish_poll(poll_fields_from(draft))
-        redis.delete(f"draft:{user_id}")
+        publish_poll(fields)
         send_message(chat_id, "✅ Sondaggio pubblicato nel canale.")
 
 
-def handle_settings_callback(callback_id, user_id, chat_id, message_id, action):
-    if not is_channel_admin(user_id):
-        answer_callback(callback_id, "Riservato agli amministratori del canale.", alert=True)
-        return
-
-    draft = get_json(f"draft:{user_id}")
-    if not draft:
-        answer_callback(callback_id, "Nessuna creazione in corso.", alert=True)
-        return
-
-    if action == "cancel":
-        redis.delete(f"draft:{user_id}")
-        edit_message(chat_id, message_id, "Creazione annullata.")
-        answer_callback(callback_id)
-        return
-
-    if action == "publish":
-        if draft.get("quiz") and "correct_index" not in draft:
-            draft["step"] = "correct"
-            set_json(f"draft:{user_id}", draft)
-            opts_text = "\n".join(f"{i + 1}. {o}" for i, o in enumerate(draft["options"]))
-            edit_message(chat_id, message_id, f"Quale opzione è quella corretta?\n\n{opts_text}\n\n"
-                                               "Rispondi con il numero in un messaggio.")
-            answer_callback(callback_id)
-            return
-
-        if draft.get("mode") == "recurrent":
-            draft["step"] = "weekday"
-            set_json(f"draft:{user_id}", draft)
-            edit_message(chat_id, message_id, "In quale giorno della settimana vuoi ricevere il "
-                                               "promemoria per pubblicare questo sondaggio?", weekday_keyboard())
-            answer_callback(callback_id)
-            return
-
-        publish_poll(poll_fields_from(draft))
-        redis.delete(f"draft:{user_id}")
-        edit_message(chat_id, message_id, "✅ Sondaggio pubblicato nel canale.")
-        answer_callback(callback_id)
-        return
-
-    draft[action] = not draft.get(action, False)
-    set_json(f"draft:{user_id}", draft)
-    edit_markup(chat_id, message_id, settings_keyboard(draft))
-    answer_callback(callback_id)
-
-
-def handle_weekday_callback(callback_id, user_id, chat_id, message_id, weekday):
-    if not is_channel_admin(user_id):
-        answer_callback(callback_id, "Riservato agli amministratori del canale.", alert=True)
-        return
-    draft = get_json(f"draft:{user_id}")
-    if not draft:
-        answer_callback(callback_id, "Nessuna creazione in corso.", alert=True)
-        return
-    tpl_id = save_template(draft, weekday, chat_id)
-    redis.delete(f"draft:{user_id}")
-    edit_message(chat_id, message_id,
-                 f"✅ Sondaggio ricorrente salvato (#{tpl_id}).\n"
-                 f"Ogni {WEEKDAY_NAMES[weekday]} riceverai un promemoria con un bottone "
-                 f"per pubblicarlo nel canale.")
-    answer_callback(callback_id)
-
+# ================= CALLBACK: VOTO E RICORRENTI =================
 
 def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
     if not is_channel_admin(user_id):
@@ -467,10 +468,7 @@ def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
     if not tpl:
         answer_callback(callback_id, "Modello non più disponibile.", alert=True)
         return
-    fields = {k: tpl[k] for k in
-              ("question", "options", "multiple", "anonymous", "quiz", "allow_revote",
-               "correct_index", "explanation")}
-    publish_poll(fields)
+    publish_poll(extract_fields(tpl))
     edit_message(chat_id, message_id, f"✅ Sondaggio pubblicato nel canale (dal modello #{tpl_id}).")
     answer_callback(callback_id)
 
@@ -508,7 +506,7 @@ def handle_vote_callback(callback_id, user, poll_id, idx):
     log_event(poll_id, user, "cambio_voto" if had_voted_before else "voto",
               ", ".join(old_names), ", ".join(new_names) or "(nessuna)")
 
-    edit_message(CHANNEL_ID, poll["message_id"], build_text(poll), build_keyboard(poll))
+    edit_message(CHANNEL_ID, poll["message_id"], build_text(poll), build_keyboard(poll), parse_mode="HTML")
     answer_callback(callback_id, f"Voto registrato: {', '.join(new_names) or 'nessuna scelta'}")
 
 
@@ -523,14 +521,16 @@ def webhook():
         msg = update["message"]
         chat_id = msg["chat"]["id"]
         user_id = msg["from"]["id"]
-        text = msg.get("text", "")
 
+        if "web_app_data" in msg:
+            handle_web_app_data(chat_id, user_id, msg["web_app_data"]["data"])
+            return {"ok": True}
+
+        text = msg.get("text", "")
         if text.startswith("/start"):
-            cmd_start(chat_id, user_id)
-        elif text.startswith("/newrecurrent"):
-            cmd_newpoll(chat_id, user_id, mode="recurrent")
-        elif text.startswith("/newpoll"):
-            cmd_newpoll(chat_id, user_id, mode="immediate")
+            cmd_start(chat_id, user_id, text.split()[1:])
+        elif text.startswith("/newpoll") or text.startswith("/newrecurrent"):
+            cmd_newpoll(chat_id, user_id)
         elif text.startswith("/polls"):
             cmd_polls(chat_id, user_id)
         elif text.startswith("/recurrents"):
@@ -541,10 +541,8 @@ def webhook():
             cmd_close(chat_id, user_id, text.split()[1:])
         elif text.startswith("/log"):
             cmd_log(chat_id, user_id, text.split()[1:])
-        elif text.startswith("/cancel"):
-            cmd_cancel(chat_id, user_id)
-        else:
-            handle_draft_message(chat_id, user_id, text)
+        elif not text.startswith("/"):
+            handle_option_suggestion(chat_id, user_id, text)
 
     elif "callback_query" in update:
         cq = update["callback_query"]
@@ -554,11 +552,7 @@ def webhook():
         message_id = cq["message"]["message_id"]
         data = cq["data"]
 
-        if data.startswith("cfg|"):
-            handle_settings_callback(callback_id, user["id"], chat_id, message_id, data.split("|", 1)[1])
-        elif data.startswith("day|"):
-            handle_weekday_callback(callback_id, user["id"], chat_id, message_id, int(data.split("|")[1]))
-        elif data.startswith("recur|"):
+        if data.startswith("recur|"):
             handle_recur_callback(callback_id, user["id"], chat_id, message_id, data.split("|")[1])
         elif data.startswith("vote|"):
             _, poll_id, idx = data.split("|")
@@ -569,35 +563,300 @@ def webhook():
 
 @app.route("/api/webhook", methods=["GET"])
 def health():
-    url = os.environ.get("UPSTASH_REDIS_REST_URL", "")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
-    tg_token = os.environ.get("TELEGRAM_TOKEN", "")
-    channel = os.environ.get("CHANNEL_ID", "")
-    return {
-        "status": "il bot è online",
-        "diagnostica_env": {
-            "UPSTASH_REDIS_REST_URL_presente": bool(url),
-            "UPSTASH_REDIS_REST_URL_inizia_con_https": url.startswith("https://"),
-            "UPSTASH_REDIS_REST_URL_lunghezza": len(url),
-            "UPSTASH_REDIS_REST_TOKEN_presente": bool(token),
-            "UPSTASH_REDIS_REST_TOKEN_lunghezza": len(token),
-            "TELEGRAM_TOKEN_presente": bool(tg_token),
-            "CHANNEL_ID_presente": bool(channel),
-            "CHANNEL_ID_valore": channel,
-        },
-    }
+    return {"status": "il bot è online"}
+
+
+# ================= WEB APP (interfaccia di creazione) =================
+
+POLLFORM_HTML = """<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Nuovo sondaggio</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #efeff4; --card: #ffffff; --text: #000000; --hint: #8e8e93;
+    --link: #007aff; --button: #007aff; --button-text: #ffffff;
+    --separator: #e3e3e8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding-bottom: 90px;
+  }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; position: sticky; top: 0; background: var(--bg); z-index: 10;
+  }
+  .topbar h1 { font-size: 17px; margin: 0; }
+  .create-btn {
+    background: var(--button); color: var(--button-text); border: none;
+    border-radius: 14px; padding: 9px 18px; font-size: 15px; font-weight: 600;
+  }
+  .create-btn:disabled { opacity: 0.4; }
+  .card {
+    background: var(--card); border-radius: 14px; margin: 10px 16px; overflow: hidden;
+  }
+  .section-label {
+    color: var(--link); font-size: 13px; font-weight: 600; text-transform: uppercase;
+    padding: 12px 16px 6px;
+  }
+  .row {
+    padding: 12px 16px; border-bottom: 1px solid var(--separator);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .row:last-child { border-bottom: none; }
+  input[type=text], textarea {
+    border: none; outline: none; font-size: 16px; width: 100%; background: transparent;
+    color: var(--text); font-family: inherit; resize: none;
+  }
+  textarea { min-height: 44px; }
+  ::placeholder { color: var(--hint); }
+  .opt-row { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--separator); }
+  .opt-remove { color: #ff3b30; font-size: 20px; line-height: 1; cursor: pointer; padding: 4px; }
+  .opt-correct { width: 20px; height: 20px; flex-shrink: 0; }
+  .add-opt { padding: 12px 16px; color: var(--link); font-size: 16px; display: flex; align-items: center; gap: 10px; cursor: pointer; }
+  .hint { color: var(--hint); font-size: 13px; padding: 4px 16px 0; }
+  .setting-row { padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--separator); gap: 12px; }
+  .setting-row:last-child { border-bottom: none; }
+  .setting-text b { display: block; font-size: 16px; }
+  .setting-text span { display: block; font-size: 13px; color: var(--hint); margin-top: 2px; }
+  .switch { position: relative; width: 46px; height: 28px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: #d1d1d6; border-radius: 28px; transition: .2s; cursor: pointer; }
+  .slider::before { content: ""; position: absolute; width: 24px; height: 24px; left: 2px; top: 2px; background: white; border-radius: 50%; transition: .2s; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+  input:checked + .slider { background: #34c759; }
+  input:checked + .slider::before { transform: translateX(18px); }
+  .link-btn { color: var(--link); font-size: 14px; padding: 8px 16px; cursor: pointer; }
+  .link-panel { padding: 10px 16px; display: none; gap: 8px; flex-direction: column; border-top: 1px solid var(--separator); }
+  .link-panel.open { display: flex; }
+  .link-panel input { border: 1px solid var(--separator); border-radius: 8px; padding: 8px 10px; }
+  .link-panel button { background: var(--button); color: var(--button-text); border: none; border-radius: 8px; padding: 8px; font-size: 14px; }
+  select {
+    border: none; background: transparent; font-size: 16px; color: var(--text);
+    font-family: inherit; width: 100%; outline: none;
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>Nuovo sondaggio</h1>
+  <button class="create-btn" id="createBtn" disabled>Crea</button>
+</div>
+
+<div class="card">
+  <div class="row">
+    <textarea id="question" placeholder="Fai una domanda" rows="2"></textarea>
+  </div>
+  <div class="link-btn" id="linkToggle">🔗 Inserisci link (sito, Google Maps...)</div>
+  <div class="link-panel" id="linkPanel">
+    <input type="text" id="linkLabel" placeholder="Testo del link (es. Apri su Maps)">
+    <input type="text" id="linkUrl" placeholder="https://...">
+    <button id="linkInsert">Inserisci nella domanda</button>
+  </div>
+</div>
+
+<div class="section-label">Opzioni</div>
+<div class="card" id="optionsCard"></div>
+<div class="hint" id="optHint"></div>
+
+<div class="section-label">Impostazioni</div>
+<div class="card">
+  <div class="setting-row">
+    <div class="setting-text"><b>Mostra chi ha votato</b><span>Il nome dei votanti è visibile a tutti</span></div>
+    <label class="switch"><input type="checkbox" id="showVoters" checked><span class="slider"></span></label>
+  </div>
+  <div class="setting-row">
+    <div class="setting-text"><b>Consenti risposte multiple</b><span>I votanti possono scegliere più opzioni</span></div>
+    <label class="switch"><input type="checkbox" id="multiple"><span class="slider"></span></label>
+  </div>
+  <div class="setting-row">
+    <div class="setting-text"><b>Consenti di cambiare voto</b><span>I votanti possono cambiare la scelta</span></div>
+    <label class="switch"><input type="checkbox" id="allowRevote" checked><span class="slider"></span></label>
+  </div>
+  <div class="setting-row">
+    <div class="setting-text"><b>Modalità quiz</b><span>Segna una risposta corretta tra le opzioni</span></div>
+    <label class="switch"><input type="checkbox" id="quiz"><span class="slider"></span></label>
+  </div>
+  <div class="setting-row">
+    <div class="setting-text"><b>Consenti di inserire opzioni</b><span>Gli utenti possono proporre nuove opzioni scrivendo al bot</span></div>
+    <label class="switch"><input type="checkbox" id="allowSuggestions"><span class="slider"></span></label>
+  </div>
+  <div class="row" id="explanationRow" style="display:none">
+    <textarea id="explanation" placeholder="Spiegazione mostrata a chiusura (opzionale)" rows="2"></textarea>
+  </div>
+</div>
+
+<div class="card">
+  <div class="setting-row">
+    <div class="setting-text"><b>Sondaggio ricorrente</b><span>Ricevi un promemoria settimanale per ripubblicarlo</span></div>
+    <label class="switch"><input type="checkbox" id="recurrent"><span class="slider"></span></label>
+  </div>
+  <div class="row" id="weekdayRow" style="display:none">
+    <select id="weekday">
+      <option value="0">Ogni Lunedì</option>
+      <option value="1">Ogni Martedì</option>
+      <option value="2">Ogni Mercoledì</option>
+      <option value="3">Ogni Giovedì</option>
+      <option value="4">Ogni Venerdì</option>
+      <option value="5">Ogni Sabato</option>
+      <option value="6">Ogni Domenica</option>
+    </select>
+  </div>
+</div>
+
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready();
+tg.expand();
+
+// Applica i colori del tema Telegram, se disponibili
+const tp = tg.themeParams || {};
+const root = document.documentElement.style;
+if (tp.bg_color) root.setProperty('--bg', tp.bg_color);
+if (tp.text_color) root.setProperty('--text', tp.text_color);
+if (tp.hint_color) root.setProperty('--hint', tp.hint_color);
+if (tp.link_color) root.setProperty('--link', tp.link_color);
+if (tp.button_color) root.setProperty('--button', tp.button_color);
+if (tp.button_text_color) root.setProperty('--button-text', tp.button_text_color);
+if (tp.secondary_bg_color) root.setProperty('--card', tp.secondary_bg_color);
+
+const optionsCard = document.getElementById('optionsCard');
+const optHint = document.getElementById('optHint');
+const MAX_OPT = 10;
+let optCount = 0;
+
+function addOption(value) {
+  if (optCount >= MAX_OPT) return;
+  optCount++;
+  const row = document.createElement('div');
+  row.className = 'opt-row';
+  row.innerHTML = `
+    <input type="radio" name="correctOpt" class="opt-correct" style="display:none">
+    <input type="text" class="opt-input" placeholder="Opzione" value="${value ? value.replace(/"/g, '&quot;') : ''}">
+    <span class="opt-remove">✕</span>`;
+  row.querySelector('.opt-remove').onclick = () => { row.remove(); optCount--; refresh(); };
+  row.querySelector('.opt-input').addEventListener('input', refresh);
+  optionsCard.appendChild(row);
+  refresh();
+}
+
+document.getElementById('optionsCard').insertAdjacentHTML('afterend', '');
+const addRow = document.createElement('div');
+addRow.className = 'add-opt';
+addRow.innerHTML = '➕ Aggiungi un\\'opzione...';
+addRow.onclick = () => addOption('');
+
+function mountAddRow() {
+  optionsCard.parentNode.insertBefore(addRow, optionsCard.nextSibling);
+}
+mountAddRow();
+
+addOption(''); addOption('');
+
+function refresh() {
+  const remaining = MAX_OPT - optCount;
+  optHint.textContent = remaining > 0 ? `Puoi aggiungere altre ${remaining} opzioni.` : 'Hai raggiunto il massimo di opzioni.';
+  addRow.style.display = optCount >= MAX_OPT ? 'none' : 'flex';
+  validate();
+}
+
+// Toggle modalità quiz: mostra selettore risposta corretta + spiegazione
+const quizToggle = document.getElementById('quiz');
+quizToggle.addEventListener('change', () => {
+  document.getElementById('explanationRow').style.display = quizToggle.checked ? 'flex' : 'none';
+  document.querySelectorAll('.opt-correct').forEach(el => el.style.display = quizToggle.checked ? 'inline-block' : 'none');
+});
+
+// Toggle sondaggio ricorrente: mostra selettore giorno
+const recurrentToggle = document.getElementById('recurrent');
+recurrentToggle.addEventListener('change', () => {
+  document.getElementById('weekdayRow').style.display = recurrentToggle.checked ? 'flex' : 'none';
+});
+
+// Pannello inserimento link
+const linkToggle = document.getElementById('linkToggle');
+const linkPanel = document.getElementById('linkPanel');
+linkToggle.onclick = () => linkPanel.classList.toggle('open');
+document.getElementById('linkInsert').onclick = () => {
+  const label = document.getElementById('linkLabel').value.trim();
+  const url = document.getElementById('linkUrl').value.trim();
+  if (!label || !url) return;
+  const q = document.getElementById('question');
+  const marker = `[${label}](${url})`;
+  const pos = (typeof q.selectionStart === 'number') ? q.selectionStart : q.value.length;
+  q.value = q.value.slice(0, pos) + marker + q.value.slice(pos);
+  const newPos = pos + marker.length;
+  q.focus();
+  q.setSelectionRange(newPos, newPos);
+  document.getElementById('linkLabel').value = '';
+  document.getElementById('linkUrl').value = '';
+  linkPanel.classList.remove('open');
+  validate();
+};
+
+document.getElementById('question').addEventListener('input', validate);
+
+function validate() {
+  const question = document.getElementById('question').value.trim();
+  const opts = [...document.querySelectorAll('.opt-input')].map(i => i.value.trim()).filter(Boolean);
+  const ok = question.length > 0 && opts.length >= 2;
+  document.getElementById('createBtn').disabled = !ok;
+}
+
+document.getElementById('createBtn').addEventListener('click', () => {
+  const question = document.getElementById('question').value.trim();
+  const optNodes = [...document.querySelectorAll('.opt-row')];
+  const options = optNodes.map(r => r.querySelector('.opt-input').value.trim()).filter(Boolean);
+
+  let correct_index = null;
+  if (quizToggle.checked) {
+    const idx = optNodes.findIndex(r => r.querySelector('.opt-correct').checked);
+    correct_index = idx >= 0 ? idx : null;
+  }
+
+  const payload = {
+    question: question,
+    options: options,
+    multiple: document.getElementById('multiple').checked,
+    anonymous: !document.getElementById('showVoters').checked,
+    allow_revote: document.getElementById('allowRevote').checked,
+    quiz: quizToggle.checked,
+    correct_index: correct_index,
+    explanation: document.getElementById('explanation').value.trim(),
+    allow_suggestions: document.getElementById('allowSuggestions').checked,
+    recurrent: recurrentToggle.checked,
+    weekday: recurrentToggle.checked ? parseInt(document.getElementById('weekday').value, 10) : null,
+  };
+
+  tg.sendData(JSON.stringify(payload));
+  tg.close();
+});
+
+validate();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/api/pollform", methods=["GET"])
+def pollform():
+    return POLLFORM_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 # ================= ENDPOINT CRON (promemoria settimanale) =================
 
 @app.route("/api/cron", methods=["GET"])
 def cron():
-    # Verifica che la chiamata arrivi davvero da Vercel Cron, non da chiunque conosca l'URL
     auth = request.headers.get("Authorization", "")
     if CRON_SECRET and auth != f"Bearer {CRON_SECRET}":
         return {"ok": False, "error": "unauthorized"}, 401
 
-    today = datetime.now(timezone.utc).weekday()  # 0 = Lunedì ... 6 = Domenica
+    today = datetime.now(timezone.utc).weekday()
     tpl_ids = redis.smembers(f"templates_by_day:{today}") or []
     if not tpl_ids:
         return {"ok": True, "reminders_sent": 0}
