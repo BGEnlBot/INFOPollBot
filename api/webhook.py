@@ -46,6 +46,7 @@ import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, request
@@ -57,6 +58,19 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 WEEKDAY_NAMES = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
+
+# L'orario del promemoria settimanale è fissato nel cron di vercel.json
+# ("0 8 * * *" = 08:00 UTC). Se cambi quell'orario, aggiorna anche questo.
+CRON_HOUR_UTC = 8
+
+
+def cron_time_rome_str() -> str:
+    """Converte l'orario del promemoria da UTC a Roma, gestendo automaticamente
+    il passaggio ora solare/legale (nessun calcolo manuale del fuso)."""
+    utc_dt = datetime.now(timezone.utc).replace(
+        hour=CRON_HOUR_UTC, minute=0, second=0, microsecond=0)
+    rome_dt = utc_dt.astimezone(ZoneInfo("Europe/Rome"))
+    return rome_dt.strftime("%H:%M")
 LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 
 redis = Redis.from_env()
@@ -512,19 +526,15 @@ def cmd_polls(chat_id, user_id):
         if p["closed"]:
             text = f"🔒 {p['question']}\n(chiuso)"
             keyboard = {"inline_keyboard": [
-                [
-                    {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{pid}"},
-                    {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{pid}"},
-                ],
+                [{"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{pid}"}],
+                [{"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{pid}"}],
                 [{"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"}],
             ]}
         else:
             text = f"📊 {p['question']}"
             keyboard = {"inline_keyboard": [
-                [
-                    {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{pid}"},
-                    {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
-                ],
+                [{"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{pid}"}],
+                [{"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"}],
                 [{"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"}],
             ]}
         send_message(chat_id, text, keyboard)
@@ -534,11 +544,12 @@ def cmd_polls(chat_id, user_id):
         if not t:
             continue
         rid = f"R{tid}"
-        text = f"📅 Sondaggio Scadenziario (ogni {WEEKDAY_NAMES[t['weekday']]})\n{t['question']}"
-        keyboard = {"inline_keyboard": [[
-            {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{rid}"},
-            {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{rid}"},
-        ]]}
+        text = (f"📅 Sondaggio Scadenziario (ogni {WEEKDAY_NAMES[t['weekday']]} "
+                f"alle {cron_time_rome_str()})\n{t['question']}")
+        keyboard = {"inline_keyboard": [
+            [{"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{rid}"}],
+            [{"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{rid}"}],
+        ]}
         send_message(chat_id, text, keyboard)
 
 
@@ -758,10 +769,8 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
     elif action == "close":
         close_poll_only(raw, poll)
         edit_message(chat_id, message_id, f"🔒 {poll['question']}\n(chiuso)", {"inline_keyboard": [
-            [
-                {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{raw}"},
-                {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{raw}"},
-            ],
+            [{"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{raw}"}],
+            [{"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{raw}"}],
             [{"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"}],
         ]})
         answer_callback(callback_id, "Sondaggio chiuso.")
@@ -769,10 +778,8 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
     elif action == "reopen":
         reopen_poll(raw, poll)
         edit_message(chat_id, message_id, f"📊 {poll['question']}", {"inline_keyboard": [
-            [
-                {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{raw}"},
-                {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
-            ],
+            [{"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{raw}"}],
+            [{"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"}],
             [{"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"}],
         ]})
         answer_callback(callback_id, "Sondaggio riaperto.")
