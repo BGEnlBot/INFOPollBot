@@ -256,7 +256,13 @@ def build_keyboard(poll: dict):
         if username:
             rows.append([{"text": "➕ Proponi un'opzione", "url": f"https://t.me/{username}?start=addopt_{poll['id']}"}])
     if poll.get("allow_external_share"):
-        rows.append([{"text": "↗️ Condividi e vota altrove", "switch_inline_query": poll["id"]}])
+        username = get_bot_username()
+        if username:
+            # Telegram NON permette bottoni "switch_inline_query" nei post
+            # di un canale: si passa quindi da un bottone url che apre la
+            # chat privata col bot, dove il vero bottone di condivisione
+            # (permesso solo lì) viene mostrato subito dopo.
+            rows.append([{"text": "↗️ Condividi e vota altrove", "url": f"https://t.me/{username}?start=share_{poll['id']}"}])
     return {"inline_keyboard": rows}
 
 
@@ -340,6 +346,19 @@ def cmd_start(chat_id, user_id, args):
         redis.set(f"awaiting_option:{user_id}", poll_id)
         send_message(chat_id, f"Scrivi il testo della nuova opzione da proporre per:\n\n"
                                f"«{poll['question']}»")
+        return
+
+    if args and args[0].startswith("share_"):
+        poll_id = args[0][len("share_"):]
+        poll = get_json(f"poll:{poll_id}")
+        if not poll or poll["closed"] or not poll.get("allow_external_share"):
+            send_message(chat_id, "Questo sondaggio non è più disponibile per la condivisione.")
+            return
+        keyboard = {"inline_keyboard": [[
+            {"text": "↗️ Scegli dove condividerlo", "switch_inline_query": poll_id}
+        ]]}
+        send_message(chat_id, f"Tocca il bottone per scegliere in quale chat condividere:\n\n"
+                               f"«{poll['question']}»", keyboard)
         return
 
     send_message(chat_id, "Ciao! Se sei amministratore del canale puoi usare:\n"
