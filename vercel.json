@@ -6,7 +6,8 @@
   "routes": [
     { "src": "/api/webhook", "dest": "api/webhook.py" },
     { "src": "/api/cron", "dest": "api/webhook.py" },
-    { "src": "/api/pollform", "dest": "api/webhook.py" }
+    { "src": "/api/pollform", "dest": "api/webhook.py" },
+    { "src": "/api/pollformdata", "dest": "api/webhook.py" }
   ],
   "crons": [
     { "path": "/api/cron", "schedule": "0 8 * * *" }
