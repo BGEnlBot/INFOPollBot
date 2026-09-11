@@ -47,6 +47,7 @@ app = Flask(__name__)
 # ================= HELPER TELEGRAM =================
 
 def tg(method: str, **params):
+    params = {k: v for k, v in params.items() if v is not None}
     r = requests.post(f"{API}/{method}", json=params, timeout=8)
     result = r.json()
     if not result.get("ok"):
