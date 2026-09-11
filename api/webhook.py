@@ -262,6 +262,7 @@ def cmd_start(chat_id, user_id, args):
 
     send_message(chat_id, "Ciao! Se sei amministratore del canale puoi usare:\n"
                            "/newpoll - crea un sondaggio (si apre una schermata dedicata)\n"
+                           "/editpoll ID - modifica domanda/opzioni di un sondaggio aperto\n"
                            "/polls - elenco sondaggi pubblicati\n"
                            "/recurrents - elenco sondaggi ricorrenti\n"
                            "/close ID - chiude un sondaggio\n"
@@ -310,6 +311,31 @@ def cmd_newpoll(chat_id, user_id):
         "one_time_keyboard": True,
     }
     send_message(chat_id, "Tocca il bottone per aprire la creazione del sondaggio:", keyboard)
+
+
+def cmd_editpoll(chat_id, user_id, args):
+    if not is_channel_admin(user_id):
+        send_message(chat_id, "Comando riservato agli amministratori del canale.")
+        return
+    if not args:
+        send_message(chat_id, "Uso: /editpoll ID  (vedi /polls per gli ID)")
+        return
+    poll_id = args[0]
+    poll = get_json(f"poll:{poll_id}")
+    if not poll:
+        send_message(chat_id, "Sondaggio non trovato.")
+        return
+    if poll["closed"]:
+        send_message(chat_id, "Questo sondaggio è chiuso e non può più essere modificato.")
+        return
+    remember_admin_chat(user_id, chat_id)
+    form_url = request.host_url.rstrip("/") + f"/api/pollform?edit={poll_id}"
+    keyboard = {
+        "keyboard": [[{"text": "✏️ Modifica sondaggio", "web_app": {"url": form_url}}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+    send_message(chat_id, f"Tocca il bottone per modificare il sondaggio #{poll_id}:", keyboard)
 
 
 def cmd_polls(chat_id, user_id):
@@ -411,6 +437,67 @@ def cmd_log(chat_id, user_id, args):
 
 # ================= RICEZIONE DATI DALLA WEB APP =================
 
+def handle_poll_edit(chat_id, user_id, payload):
+    poll_id = payload["edit_poll_id"]
+    poll = get_json(f"poll:{poll_id}")
+    if not poll:
+        send_message(chat_id, "Sondaggio non trovato.")
+        return
+    if poll["closed"]:
+        send_message(chat_id, "Questo sondaggio è ormai chiuso e non può più essere modificato.")
+        return
+
+    question = (payload.get("question") or "").strip()
+    new_options = [o.strip() for o in payload.get("options", []) if o.strip()]
+    if not question:
+        send_message(chat_id, "La domanda non può essere vuota. Modifica annullata.")
+        return
+    if not (2 <= len(new_options) <= 10):
+        send_message(chat_id, "Servono tra 2 e 10 opzioni. Modifica annullata.")
+        return
+
+    # Rimappa i voti esistenti: le opzioni il cui testo non è cambiato
+    # mantengono i voti; le opzioni rimosse o rinominate perdono i loro
+    # voti (in modo pulito, senza corrompere i voti sulle altre opzioni).
+    old_index_by_text = {}
+    for i, t in enumerate(poll["options"]):
+        old_index_by_text.setdefault(t, i)
+    old_to_new = {}
+    remaining = dict(old_index_by_text)
+    for new_i, t in enumerate(new_options):
+        if t in remaining:
+            old_to_new[remaining.pop(t)] = new_i
+
+    new_votes = {}
+    for uid, entry in poll["votes"].items():
+        remapped = [old_to_new[c] for c in entry["choices"] if c in old_to_new]
+        if remapped:
+            new_votes[uid] = {"name": entry["name"], "choices": remapped}
+
+    multiple = bool(payload.get("multiple"))
+    if not multiple:
+        # Se le risposte multiple vengono disattivate, ogni voto deve
+        # mantenere una sola scelta (la prima), altrimenti resterebbe
+        # temporaneamente incoerente fino al prossimo voto dell'utente.
+        for entry in new_votes.values():
+            entry["choices"] = entry["choices"][:1]
+
+    poll["question"] = question
+    poll["options"] = new_options
+    poll["votes"] = new_votes
+    poll["multiple"] = multiple
+    poll["anonymous"] = bool(payload.get("anonymous"))
+    poll["quiz"] = bool(payload.get("quiz"))
+    poll["allow_revote"] = bool(payload.get("allow_revote", True))
+    poll["correct_index"] = payload.get("correct_index")
+    poll["explanation"] = (payload.get("explanation") or "").strip()
+    poll["allow_suggestions"] = bool(payload.get("allow_suggestions"))
+
+    set_json(f"poll:{poll_id}", poll)
+    edit_message(CHANNEL_ID, poll["message_id"], build_text(poll), build_keyboard(poll), parse_mode="HTML")
+    send_message(chat_id, "✅ Sondaggio aggiornato nel canale.")
+
+
 def handle_web_app_data(chat_id, user_id, raw_data):
     if not is_channel_admin(user_id):
         send_message(chat_id, "Comando riservato agli amministratori del canale.")
@@ -420,6 +507,10 @@ def handle_web_app_data(chat_id, user_id, raw_data):
         payload = json.loads(raw_data)
     except (ValueError, TypeError):
         send_message(chat_id, "Dati del sondaggio non validi, riprova con /newpoll.")
+        return
+
+    if payload.get("edit_poll_id"):
+        handle_poll_edit(chat_id, user_id, payload)
         return
 
     question = (payload.get("question") or "").strip()
@@ -539,6 +630,8 @@ def webhook():
             cmd_delrecurrent(chat_id, user_id, text.split()[1:])
         elif text.startswith("/close"):
             cmd_close(chat_id, user_id, text.split()[1:])
+        elif text.startswith("/editpoll"):
+            cmd_editpoll(chat_id, user_id, text.split()[1:])
         elif text.startswith("/log"):
             cmd_log(chat_id, user_id, text.split()[1:])
         elif not text.startswith("/"):
@@ -690,7 +783,7 @@ POLLFORM_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<div class="card">
+<div class="card" id="recurrentCard">
   <div class="setting-row">
     <div class="setting-text"><b>Sondaggio ricorrente</b><span>Ricevi un promemoria settimanale per ripubblicarlo</span></div>
     <label class="switch"><input type="checkbox" id="recurrent"><span class="slider"></span></label>
@@ -757,6 +850,49 @@ mountAddRow();
 
 addOption(''); addOption('');
 
+// ---- Modalità modifica: se la Web App è aperta con ?edit=ID, precompila ----
+const urlParams = new URLSearchParams(location.search);
+const editId = urlParams.get('edit');
+
+if (editId) {
+  document.querySelector('.topbar h1').textContent = 'Modifica sondaggio';
+  document.getElementById('recurrentCard').style.display = 'none';
+  document.getElementById('createBtn').textContent = 'Salva';
+
+  // rimuove le due righe opzione vuote create di default, verranno ripopolate
+  optionsCard.innerHTML = '';
+  optCount = 0;
+
+  fetch(`/api/pollformdata?id=${encodeURIComponent(editId)}`)
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        alert('Sondaggio non trovato o già chiuso: impossibile modificarlo.');
+        tg.close();
+        return;
+      }
+      const p = data.poll;
+      document.getElementById('question').value = p.question || '';
+      (p.options || []).forEach(o => addOption(o));
+      document.getElementById('showVoters').checked = !p.anonymous;
+      document.getElementById('multiple').checked = !!p.multiple;
+      document.getElementById('allowRevote').checked = !!p.allow_revote;
+      document.getElementById('allowSuggestions').checked = !!p.allow_suggestions;
+      document.getElementById('explanation').value = p.explanation || '';
+      quizToggle.checked = !!p.quiz;
+      quizToggle.dispatchEvent(new Event('change'));
+      if (p.quiz && p.correct_index !== null && p.correct_index !== undefined) {
+        const radios = document.querySelectorAll('.opt-correct');
+        if (radios[p.correct_index]) radios[p.correct_index].checked = true;
+      }
+      validate();
+    })
+    .catch(() => {
+      alert('Errore nel caricamento del sondaggio da modificare.');
+      tg.close();
+    });
+}
+
 function refresh() {
   const remaining = MAX_OPT - optCount;
   optHint.textContent = remaining > 0 ? `Puoi aggiungere altre ${remaining} opzioni.` : 'Hai raggiunto il massimo di opzioni.';
@@ -819,6 +955,7 @@ document.getElementById('createBtn').addEventListener('click', () => {
   }
 
   const payload = {
+    edit_poll_id: editId || null,
     question: question,
     options: options,
     multiple: document.getElementById('multiple').checked,
@@ -846,6 +983,25 @@ validate();
 @app.route("/api/pollform", methods=["GET"])
 def pollform():
     return POLLFORM_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/api/pollformdata", methods=["GET"])
+def pollformdata():
+    poll_id = request.args.get("id", "")
+    poll = get_json(f"poll:{poll_id}")
+    if not poll or poll.get("closed"):
+        return {"ok": False}, 404
+    return {"ok": True, "poll": {
+        "question": poll["question"],
+        "options": poll["options"],
+        "multiple": poll["multiple"],
+        "anonymous": poll["anonymous"],
+        "quiz": poll["quiz"],
+        "allow_revote": poll["allow_revote"],
+        "correct_index": poll["correct_index"],
+        "explanation": poll.get("explanation", ""),
+        "allow_suggestions": poll.get("allow_suggestions", False),
+    }}
 
 
 # ================= ENDPOINT CRON (promemoria settimanale) =================
