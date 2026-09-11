@@ -63,6 +63,19 @@ redis = Redis.from_env()
 app = Flask(__name__)
 
 
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    """
+    Rete di sicurezza: se qualcosa va storto in modo imprevisto, risponde
+    con un errore JSON leggibile invece di una pagina HTML di errore
+    (che altrimenti il JavaScript della Web App non riesce a interpretare,
+    mostrando solo un generico "errore di connessione").
+    """
+    import traceback
+    print(f"[ERRORE NON GESTITO] {traceback.format_exc()}", flush=True)
+    return {"ok": False, "message": f"Errore interno del bot: {e}"}, 500
+
+
 # ================= HELPER TESTO / HTML =================
 
 def esc(s) -> str:
@@ -274,15 +287,18 @@ def sync_poll(poll: dict):
         set_json(f"poll:{poll_id}", poll)
 
 
-def publish_poll(fields: dict) -> dict:
+def publish_poll(fields: dict):
+    """Ritorna (poll, None) se la pubblicazione riesce, oppure (None, errore) se Telegram la rifiuta."""
     poll_id = next_id("poll_counter")
     poll = dict(fields)
     poll.update({"id": poll_id, "closed": False, "votes": {}, "inline_message_ids": []})
     res = send_message(CHANNEL_ID, build_text(poll), build_keyboard(poll), parse_mode="HTML")
+    if not res.get("ok"):
+        return None, res.get("description", "Errore sconosciuto restituito da Telegram.")
     poll["message_id"] = res["result"]["message_id"]
     set_json(f"poll:{poll_id}", poll)
     redis.sadd("polls_index", poll_id)
-    return poll
+    return poll, None
 
 
 def save_template(fields: dict, weekday: int, creator_chat_id: int) -> str:
@@ -596,7 +612,10 @@ def handle_web_app_data(chat_id, user_id, payload):
                                f"con un bottone per pubblicarlo nel canale.")
         return True, "Sondaggio ricorrente salvato."
     else:
-        publish_poll(fields)
+        poll, err = publish_poll(fields)
+        if not poll:
+            send_message(chat_id, f"❌ Telegram ha rifiutato la pubblicazione: {err}")
+            return False, f"Telegram ha rifiutato la pubblicazione: {err}"
         send_message(chat_id, "✅ Sondaggio pubblicato nel canale.")
         return True, "Sondaggio pubblicato."
 
@@ -611,7 +630,11 @@ def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
     if not tpl:
         answer_callback(callback_id, "Modello non più disponibile.", alert=True)
         return
-    publish_poll(extract_fields(tpl))
+    poll, err = publish_poll(extract_fields(tpl))
+    if not poll:
+        edit_message(chat_id, message_id, f"❌ Telegram ha rifiutato la pubblicazione: {err}")
+        answer_callback(callback_id, "Errore nella pubblicazione.", alert=True)
+        return
     edit_message(chat_id, message_id, f"✅ Sondaggio pubblicato nel canale (dal modello #{tpl_id}).")
     answer_callback(callback_id)
 
