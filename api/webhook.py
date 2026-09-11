@@ -48,7 +48,10 @@ app = Flask(__name__)
 
 def tg(method: str, **params):
     r = requests.post(f"{API}/{method}", json=params, timeout=8)
-    return r.json()
+    result = r.json()
+    if not result.get("ok"):
+        print(f"[TELEGRAM API ERROR] {method} -> {result}")
+    return result
 
 
 def send_message(chat_id, text, reply_markup=None):
@@ -513,6 +516,7 @@ def handle_vote_callback(callback_id, user, poll_id, idx):
 @app.route("/api/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
+    print(f"[UPDATE RICEVUTO] {json.dumps(update)}")
 
     if "message" in update:
         msg = update["message"]
