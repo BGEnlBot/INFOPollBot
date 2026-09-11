@@ -368,7 +368,8 @@ def cmd_start(chat_id, user_id, args):
                            "/recurrents - elenco sondaggi ricorrenti\n"
                            "/close ID - chiude un sondaggio\n"
                            "/delrecurrent ID - elimina un modello ricorrente\n"
-                           "/log ID - riepilogo voti di un sondaggio")
+                           "/log ID - riepilogo voti di un sondaggio",
+                 reply_markup={"remove_keyboard": True})
 
 
 def handle_option_suggestion(chat_id, user_id, text):
