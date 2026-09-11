@@ -50,7 +50,7 @@ def tg(method: str, **params):
     r = requests.post(f"{API}/{method}", json=params, timeout=8)
     result = r.json()
     if not result.get("ok"):
-        print(f"[TELEGRAM API ERROR] {method} -> {result}")
+        print(f"[TELEGRAM API ERROR] {method} -> {result}", flush=True)
     return result
 
 
@@ -516,7 +516,7 @@ def handle_vote_callback(callback_id, user, poll_id, idx):
 @app.route("/api/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
-    print(f"[UPDATE RICEVUTO] {json.dumps(update)}")
+    print(f"[UPDATE RICEVUTO] {json.dumps(update)}", flush=True)
 
     if "message" in update:
         msg = update["message"]
