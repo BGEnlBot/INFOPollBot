@@ -58,19 +58,6 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 WEEKDAY_NAMES = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
-
-# L'orario del promemoria settimanale è fissato nel cron di vercel.json
-# ("0 8 * * *" = 08:00 UTC). Se cambi quell'orario, aggiorna anche questo.
-CRON_HOUR_UTC = 8
-
-
-def cron_time_rome_str() -> str:
-    """Converte l'orario del promemoria da UTC a Roma, gestendo automaticamente
-    il passaggio ora solare/legale (nessun calcolo manuale del fuso)."""
-    utc_dt = datetime.now(timezone.utc).replace(
-        hour=CRON_HOUR_UTC, minute=0, second=0, microsecond=0)
-    rome_dt = utc_dt.astimezone(ZoneInfo("Europe/Rome"))
-    return rome_dt.strftime("%H:%M")
 LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 
 redis = Redis.from_env()
@@ -213,6 +200,11 @@ def next_id(counter_key: str) -> str:
     return str(redis.incr(counter_key))
 
 
+def now_rome() -> datetime:
+    """Ora attuale nel fuso di Roma, gestendo da sola ora solare/legale."""
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Rome"))
+
+
 def parse_item_id(id_str: str):
     """Interpreta un ID: 'R5' -> ('template', '5'), '5' -> ('poll', '5')."""
     if id_str.startswith("R"):
@@ -328,10 +320,10 @@ def publish_poll(fields: dict):
     return poll, None
 
 
-def save_template(fields: dict, weekday: int, creator_chat_id: int) -> str:
+def save_template(fields: dict, weekday: int, hour: int, creator_chat_id: int) -> str:
     tpl_id = next_id("template_counter")
     tpl = dict(fields)
-    tpl.update({"id": tpl_id, "weekday": weekday, "creator_chat_id": creator_chat_id})
+    tpl.update({"id": tpl_id, "weekday": weekday, "hour": hour, "creator_chat_id": creator_chat_id})
     set_json(f"template:{tpl_id}", tpl)
     redis.sadd("templates_index", tpl_id)
     redis.sadd(f"templates_by_day:{weekday}", tpl_id)
@@ -507,6 +499,13 @@ def build_log_text(poll_id: str) -> str:
     return "\n".join(lines).strip()
 
 
+def pad_for_width(line: str, min_len: int = 42) -> str:
+    """Allarga la prima riga del messaggio (con spazi finali, invisibili)
+    così Telegram disegna una bolla più larga e i bottoni ci stanno
+    comodamente sulla stessa riga invece di essere compressi."""
+    return line if len(line) >= min_len else line + " " * (min_len - len(line))
+
+
 def cmd_polls(chat_id, user_id):
     if not is_channel_admin(user_id):
         send_message(chat_id, "Comando riservato agli amministratori del canale.")
@@ -524,19 +523,19 @@ def cmd_polls(chat_id, user_id):
         if not p:
             continue
         if p["closed"]:
-            text = f"🔒 {p['question']}\n(chiuso)"
-            keyboard = {"inline_keyboard": [
-                [{"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{pid}"}],
-                [{"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{pid}"}],
-                [{"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"}],
-            ]}
+            text = pad_for_width(f"🔒 {p['question']}") + "\n(chiuso)"
+            keyboard = {"inline_keyboard": [[
+                {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{pid}"},
+                {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{pid}"},
+                {"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"},
+            ]]}
         else:
-            text = f"📊 {p['question']}"
-            keyboard = {"inline_keyboard": [
-                [{"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{pid}"}],
-                [{"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"}],
-                [{"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"}],
-            ]}
+            text = pad_for_width(f"📊 {p['question']}")
+            keyboard = {"inline_keyboard": [[
+                {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{pid}"},
+                {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
+                {"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"},
+            ]]}
         send_message(chat_id, text, keyboard)
 
     for tid in tpl_ids:
@@ -544,12 +543,13 @@ def cmd_polls(chat_id, user_id):
         if not t:
             continue
         rid = f"R{tid}"
-        text = (f"📅 Sondaggio Scadenziario (ogni {WEEKDAY_NAMES[t['weekday']]} "
-                f"alle {cron_time_rome_str()})\n{t['question']}")
-        keyboard = {"inline_keyboard": [
-            [{"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{rid}"}],
-            [{"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{rid}"}],
-        ]}
+        first_line = pad_for_width(
+            f"📅 Sondaggio Scadenziario (ogni {WEEKDAY_NAMES[t['weekday']]} alle {t.get('hour', 9):02d}:00)")
+        text = f"{first_line}\n{t['question']}"
+        keyboard = {"inline_keyboard": [[
+            {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{rid}"},
+            {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{rid}"},
+        ]]}
         send_message(chat_id, text, keyboard)
 
 
@@ -640,6 +640,12 @@ def handle_template_edit(chat_id, user_id, payload):
         return False, "Giorno della settimana non valido."
     weekday = int(weekday)
 
+    hour = payload.get("hour")
+    if hour is None or not (0 <= int(hour) <= 23):
+        send_message(chat_id, "Orario non valido. Modifica annullata.")
+        return False, "Orario non valido."
+    hour = int(hour)
+
     old_weekday = tpl["weekday"]
     tpl["question"] = question
     tpl["options"] = new_options
@@ -652,13 +658,14 @@ def handle_template_edit(chat_id, user_id, payload):
     tpl["allow_suggestions"] = bool(payload.get("allow_suggestions"))
     tpl["allow_external_share"] = bool(payload.get("allow_external_share"))
     tpl["weekday"] = weekday
+    tpl["hour"] = hour
 
     set_json(f"template:{tpl_id}", tpl)
     if weekday != old_weekday:
         redis.srem(f"templates_by_day:{old_weekday}", tpl_id)
         redis.sadd(f"templates_by_day:{weekday}", tpl_id)
 
-    send_message(chat_id, f"✅ Sondaggio ricorrente aggiornato (ogni {WEEKDAY_NAMES[weekday]}).")
+    send_message(chat_id, f"✅ Sondaggio ricorrente aggiornato (ogni {WEEKDAY_NAMES[weekday]} alle {hour:02d}:00).")
     return True, "Sondaggio ricorrente aggiornato."
 
 
@@ -695,11 +702,14 @@ def handle_web_app_data(chat_id, user_id, payload):
 
     if payload.get("recurrent"):
         weekday = payload.get("weekday")
+        hour = payload.get("hour")
         if weekday is None or not (0 <= int(weekday) <= 6):
             return False, "Giorno della settimana non valido."
-        tpl_id = save_template(fields, int(weekday), chat_id)
-        send_message(chat_id, f"✅ Sondaggio ricorrente salvato (#{tpl_id}).\n"
-                               f"Ogni {WEEKDAY_NAMES[int(weekday)]} riceverai un promemoria "
+        if hour is None or not (0 <= int(hour) <= 23):
+            return False, "Orario non valido."
+        tpl_id = save_template(fields, int(weekday), int(hour), chat_id)
+        send_message(chat_id, f"✅ Sondaggio ricorrente salvato (#R{tpl_id}).\n"
+                               f"Ogni {WEEKDAY_NAMES[int(weekday)]} alle {int(hour):02d}:00 riceverai un promemoria "
                                f"con un bottone per pubblicarlo nel canale.")
         return True, "Sondaggio ricorrente salvato."
     else:
@@ -768,20 +778,22 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
 
     elif action == "close":
         close_poll_only(raw, poll)
-        edit_message(chat_id, message_id, f"🔒 {poll['question']}\n(chiuso)", {"inline_keyboard": [
-            [{"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{raw}"}],
-            [{"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{raw}"}],
-            [{"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"}],
-        ]})
+        text = pad_for_width(f"🔒 {poll['question']}") + "\n(chiuso)"
+        edit_message(chat_id, message_id, text, {"inline_keyboard": [[
+            {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{raw}"},
+            {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{raw}"},
+            {"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"},
+        ]]})
         answer_callback(callback_id, "Sondaggio chiuso.")
 
     elif action == "reopen":
         reopen_poll(raw, poll)
-        edit_message(chat_id, message_id, f"📊 {poll['question']}", {"inline_keyboard": [
-            [{"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{raw}"}],
-            [{"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"}],
-            [{"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"}],
-        ]})
+        text = pad_for_width(f"📊 {poll['question']}")
+        edit_message(chat_id, message_id, text, {"inline_keyboard": [[
+            {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{raw}"},
+            {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
+            {"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"},
+        ]]})
         answer_callback(callback_id, "Sondaggio riaperto.")
 
     elif action == "delete":
@@ -1086,7 +1098,22 @@ POLLFORM_HTML = """<!DOCTYPE html>
       <option value="5">Ogni Sabato</option>
       <option value="6">Ogni Domenica</option>
     </select>
+    <select id="hour">
+      <option value="0">00:00</option><option value="1">01:00</option>
+      <option value="2">02:00</option><option value="3">03:00</option>
+      <option value="4">04:00</option><option value="5">05:00</option>
+      <option value="6">06:00</option><option value="7">07:00</option>
+      <option value="8">08:00</option><option value="9" selected>09:00</option>
+      <option value="10">10:00</option><option value="11">11:00</option>
+      <option value="12">12:00</option><option value="13">13:00</option>
+      <option value="14">14:00</option><option value="15">15:00</option>
+      <option value="16">16:00</option><option value="17">17:00</option>
+      <option value="18">18:00</option><option value="19">19:00</option>
+      <option value="20">20:00</option><option value="21">21:00</option>
+      <option value="22">22:00</option><option value="23">23:00</option>
+    </select>
   </div>
+  <div class="hint" style="padding-bottom:12px">Orario di Roma. Il promemoria arriva entro la mezz'ora successiva.</div>
 </div>
 
 <script>
@@ -1165,6 +1192,7 @@ if (editId) {
         document.getElementById('recurrentToggleRow').style.display = 'none';
         document.getElementById('weekdayRow').style.display = 'flex';
         document.getElementById('weekday').value = String(p.weekday);
+        document.getElementById('hour').value = String(p.hour != null ? p.hour : 9);
       } else {
         document.querySelector('.topbar h1').textContent = 'Modifica sondaggio';
         document.getElementById('recurrentCard').style.display = 'none';
@@ -1272,6 +1300,9 @@ document.getElementById('createBtn').addEventListener('click', () => {
     weekday: isTemplateEdit
       ? parseInt(document.getElementById('weekday').value, 10)
       : ((!editId && recurrentToggle.checked) ? parseInt(document.getElementById('weekday').value, 10) : null),
+    hour: isTemplateEdit
+      ? parseInt(document.getElementById('hour').value, 10)
+      : ((!editId && recurrentToggle.checked) ? parseInt(document.getElementById('hour').value, 10) : null),
   };
 
   fetch('/api/submitpoll', {
@@ -1343,6 +1374,7 @@ def pollformdata():
             "allow_suggestions": tpl.get("allow_suggestions", False),
             "allow_external_share": tpl.get("allow_external_share", False),
             "weekday": tpl["weekday"],
+            "hour": tpl.get("hour", 9),
         }}
 
     poll = get_json(f"poll:{raw}")
@@ -1363,6 +1395,18 @@ def pollformdata():
 
 
 # ================= ENDPOINT CRON (promemoria settimanale) =================
+#
+# NOTA SULLA FREQUENZA: il piano gratuito di Vercel permette al massimo un
+# cron nativo al giorno, quindi da solo non basta per rispettare un orario
+# scelto liberamente per ogni sondaggio ricorrente. Per far funzionare
+# davvero la selezione dell'orario, questo endpoint va chiamato più spesso
+# (ogni 15-30 minuti) tramite un servizio esterno gratuito (es. cron-job.org)
+# che invii una richiesta GET con l'header:
+#     Authorization: Bearer <CRON_SECRET>
+# (il valore di CRON_SECRET si trova nelle Environment Variables del
+# progetto su Vercel). Il cron nativo di Vercel può restare comunque
+# attivo come ulteriore rete di sicurezza: le chiamate ripetute non fanno
+# danni, grazie al controllo anti-doppio-invio più sotto.
 
 @app.route("/api/cron", methods=["GET"])
 def cron():
@@ -1382,24 +1426,35 @@ def cron():
             if poll["closed"]:
                 closed_now += 1
 
-    # 2) Promemoria settimanali per i sondaggi ricorrenti.
-    today = datetime.now(timezone.utc).weekday()
+    # 2) Promemoria per i sondaggi ricorrenti il cui giorno E orario
+    # (fuso di Roma) coincidono con l'orario attuale di questa chiamata.
+    # Il controllo anti-doppio-invio evita che, chiamando questo endpoint
+    # più volte nella stessa ora, lo stesso promemoria parta più volte.
+    now = now_rome()
+    today = now.weekday()
+    current_hour = now.hour
+    date_str = now.strftime("%Y-%m-%d")
+
     tpl_ids = redis.smembers(f"templates_by_day:{today}") or []
     sent = 0
     if tpl_ids:
         admin_chats = redis.smembers("admin_chats") or []
         for tid in tpl_ids:
             tpl = get_json(f"template:{tid}")
-            if not tpl:
+            if not tpl or tpl.get("hour", 9) != current_hour:
+                continue
+            dedup_key = f"reminder_sent:{tid}:{date_str}"
+            if redis.get(dedup_key):
                 continue
             keyboard = {"inline_keyboard": [[
                 {"text": "✅ Crea sondaggio ora", "callback_data": f"recur|{tid}"}
             ]]}
-            text = f"📅 Promemoria: oggi è il giorno per pubblicare il sondaggio ricorrente #{tid}:\n\n{tpl['question']}"
+            text = f"📅 Promemoria: è il momento di pubblicare il sondaggio ricorrente #R{tid}:\n\n{tpl['question']}"
             for entry in admin_chats:
                 uid_str, chat_id_str = entry.split(":")
                 if is_channel_admin(int(uid_str)):
                     send_message(int(chat_id_str), text, keyboard)
                     sent += 1
+            redis.set(dedup_key, "1", ex=172800)  # scade da solo dopo 2 giorni
 
     return {"ok": True, "reminders_sent": sent, "polls_closed_deleted": closed_now}
