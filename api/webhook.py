@@ -1,19 +1,25 @@
 """
 Bot Telegram per sondaggi - versione WEBHOOK per Vercel, con interfaccia
-di creazione basata su TELEGRAM WEB APP (Mini App), non più su messaggi
-di testo a step rigidi.
+di creazione basata su TELEGRAM WEB APP (Mini App) e pubblicazione con
+anteprima + scelta della chat di destinazione.
 
-COME FUNZIONA L'INTERFACCIA:
-  - /newpoll manda in chat privata un bottone "📊 Crea sondaggio"
-  - Il bottone apre una pagina HTML DENTRO Telegram (Web App), con lo
-    stesso stile del tema dell'utente (chiaro/scuro), dove si scrive
-    liberamente domanda + opzioni + impostazioni, tutto su una sola
-    schermata modificabile in qualsiasi ordine (come il sondaggio
-    nativo di Telegram)
-  - Nella domanda si possono inserire link cliccabili con il pulsante
+COME FUNZIONA:
+  - /newpoll (o "✏️ Modifica" da /polls) apre una Web App dentro Telegram,
+    con lo stesso stile del tema dell'utente (chiaro/scuro), dove si
+    scrive liberamente domanda + opzioni + impostazioni, in qualsiasi
+    ordine (come il sondaggio nativo di Telegram)
+  - Nella domanda si possono inserire più link cliccabili col pulsante
     "🔗 Inserisci link" (testo + URL, anche Google Maps)
-  - Alla pressione di "Crea", la Web App manda i dati al bot
-    (Telegram.WebApp.sendData) che pubblica il sondaggio nel canale
+  - Premendo "Crea" NON si pubblica subito: il bot mostra un'ANTEPRIMA
+    in chat privata con due bottoni:
+      ✏️ Modifica  -> riapre la Web App, poi torna di nuovo alla preview
+      🚀 Pubblica   -> apre il selettore chat di Telegram: si sceglie
+                       in quale chat/gruppo/canale pubblicarlo
+  - Da quel momento il sondaggio è "vivo": ogni voto aggiorna tutte le
+    copie conosciute (quella pubblicata, più eventuali condivisioni
+    fatte con "↗️ Condividi e vota altrove", se attivata)
+  - I sondaggi ricorrenti seguono lo stesso percorso: il promemoria
+    settimanale porta a un'anteprima, non a una pubblicazione automatica
 
 ARCHITETTURA:
   - Nessun polling: Telegram chiama /api/webhook ad ogni evento
@@ -24,7 +30,10 @@ ARCHITETTURA:
 
 VARIABILI D'AMBIENTE (Vercel -> Project Settings -> Environment Variables):
     TELEGRAM_TOKEN              token del bot, da @BotFather
-    CHANNEL_ID                  ID del CANALE (es. "@nomecanale" o -100...)
+    CHANNEL_ID                  canale i cui admin possono usare il bot
+                                 (es. "@nomecanale" o -100...) — serve solo
+                                 per stabilire CHI può usare il bot, non è
+                                 più la destinazione automatica dei sondaggi
     UPSTASH_REDIS_REST_URL      da dashboard Upstash
     UPSTASH_REDIS_REST_TOKEN    da dashboard Upstash
     CRON_SECRET                 generato automaticamente da Vercel
@@ -35,6 +44,10 @@ DOPO IL DEPLOY, imposta il webhook (una volta sola):
 NOTA IMPORTANTE: la Web App di Telegram richiede HTTPS con certificato
 valido (Vercel lo fornisce sempre di default, nessuna azione richiesta)
 e funziona solo se aperta da una chat PRIVATA con il bot (non nei canali).
+
+NOTA SU BOTFATHER: perché il bottone "🚀 Pubblica" funzioni, il bot deve
+avere la modalità inline attiva: su @BotFather usa /setinline (con un
+testo placeholder a scelta) e /setinlinefeedback impostato su "Enabled".
 """
 
 import hashlib
@@ -279,51 +292,56 @@ def build_keyboard(poll: dict):
     return {"inline_keyboard": rows}
 
 
+def build_preview_keyboard(poll_id: str):
+    """Bottoni della bozza mostrata in chat privata prima della pubblicazione."""
+    return {"inline_keyboard": [
+        [{"text": "✏️ Modifica", "web_app": {"url": edit_form_url(poll_id)}}],
+        [{"text": "🚀 Pubblica", "switch_inline_query": f"pub|{poll_id}"}],
+    ]}
+
+
 def sync_poll(poll: dict):
     """
-    Aggiorna TUTTE le copie conosciute del sondaggio: quella nel canale
-    e le eventuali copie condivise altrove tramite modalità inline.
-    Se la copia nel canale risulta cancellata, chiude il sondaggio
-    ovunque (unico modo per accorgersi di una cancellazione, dato che
-    Telegram non notifica i bot quando un messaggio viene eliminato).
+    Aggiorna TUTTE le copie conosciute del sondaggio (dovunque siano state
+    pubblicate/condivise). Se una copia risulta cancellata, la toglie
+    dall'elenco; se restano zero copie, chiude il sondaggio (unico modo
+    per accorgersi di una cancellazione, dato che Telegram non notifica
+    mai un bot quando un messaggio viene eliminato).
     """
     poll_id = poll["id"]
-    res = tg("editMessageText", chat_id=CHANNEL_ID, message_id=poll["message_id"],
-             text=build_text(poll), reply_markup=build_keyboard(poll), parse_mode="HTML")
-
-    if not res.get("ok") and "not found" in res.get("description", "").lower():
-        poll["closed"] = True
-        set_json(f"poll:{poll_id}", poll)
-
+    locations = poll.get("locations", [])
     still_valid = []
-    for imid in poll.get("inline_message_ids", []):
+    for imid in locations:
         r = tg("editMessageText", inline_message_id=imid,
                text=build_text(poll), reply_markup=build_keyboard(poll), parse_mode="HTML")
         if r.get("ok") or "not found" not in r.get("description", "").lower():
             still_valid.append(imid)
-    if still_valid != poll.get("inline_message_ids", []):
-        poll["inline_message_ids"] = still_valid
+
+    changed = still_valid != locations
+    poll["locations"] = still_valid
+    if not still_valid and locations and not poll["closed"]:
+        # c'erano copie ma sono sparite tutte: il sondaggio è stato cancellato ovunque
+        poll["closed"] = True
+        changed = True
+    if changed:
         set_json(f"poll:{poll_id}", poll)
 
 
-def publish_poll(fields: dict):
-    """Ritorna (poll, None) se la pubblicazione riesce, oppure (None, errore) se Telegram la rifiuta."""
+def create_draft(fields: dict, creator_chat_id) -> dict:
+    """Crea il sondaggio in memoria ma non lo pubblica da nessuna parte:
+    resta una bozza finché l'admin non preme 'Pubblica' e sceglie la chat."""
     poll_id = next_id("poll_counter")
     poll = dict(fields)
-    poll.update({"id": poll_id, "closed": False, "votes": {}, "inline_message_ids": []})
-    res = send_message(CHANNEL_ID, build_text(poll), build_keyboard(poll), parse_mode="HTML")
-    if not res.get("ok"):
-        return None, res.get("description", "Errore sconosciuto restituito da Telegram.")
-    poll["message_id"] = res["result"]["message_id"]
+    poll.update({"id": poll_id, "closed": False, "votes": {}, "locations": [],
+                 "creator_chat_id": creator_chat_id})
     set_json(f"poll:{poll_id}", poll)
-    redis.sadd("polls_index", poll_id)
-    return poll, None
+    return poll
 
 
-def save_template(fields: dict, weekday: int, hour: int, creator_chat_id: int) -> str:
+def save_template(fields: dict, weekday: int, creator_chat_id: int) -> str:
     tpl_id = next_id("template_counter")
     tpl = dict(fields)
-    tpl.update({"id": tpl_id, "weekday": weekday, "hour": hour, "creator_chat_id": creator_chat_id})
+    tpl.update({"id": tpl_id, "weekday": weekday, "creator_chat_id": creator_chat_id})
     set_json(f"template:{tpl_id}", tpl)
     redis.sadd("templates_index", tpl_id)
     redis.sadd(f"templates_by_day:{weekday}", tpl_id)
@@ -348,9 +366,7 @@ def delete_poll_completely(poll_id: str, poll: dict):
     poi lo rimuove del tutto (log dei voti inclusi, persi volutamente)."""
     poll["closed"] = True
     final_text = build_text(poll) + "\n\n🗑️ Sondaggio eliminato dall'amministratore."
-    tg("editMessageText", chat_id=CHANNEL_ID, message_id=poll["message_id"],
-       text=final_text, parse_mode="HTML")
-    for imid in poll.get("inline_message_ids", []):
+    for imid in poll.get("locations", []):
         tg("editMessageText", inline_message_id=imid, text=final_text, parse_mode="HTML")
     redis.delete(f"poll:{poll_id}")
     redis.srem("polls_index", poll_id)
@@ -372,31 +388,10 @@ def extract_fields(payload: dict) -> dict:
     return {k: payload.get(k) for k in POLL_FIELD_KEYS}
 
 
-def open_edit_webapp(chat_id, id_str: str):
-    """Manda il bottone per aprire la Web App in modalità modifica,
-    sia per un sondaggio pubblicato sia per un modello ricorrente."""
-    kind, raw = parse_item_id(id_str)
-    if kind == "template":
-        tpl = get_json(f"template:{raw}")
-        if not tpl:
-            send_message(chat_id, "Sondaggio ricorrente non trovato.")
-            return
-        label = f"R{raw}"
-        form_url = request.host_url.rstrip("/") + f"/api/pollform?edit={label}"
-        keyboard = {"inline_keyboard": [[{"text": "✏️ Modifica sondaggio ricorrente", "web_app": {"url": form_url}}]]}
-        send_message(chat_id, f"Tocca il bottone per modificare il sondaggio ricorrente #{label}:", keyboard)
-        return
-
-    poll = get_json(f"poll:{raw}")
-    if not poll:
-        send_message(chat_id, "Sondaggio non trovato.")
-        return
-    if poll["closed"]:
-        send_message(chat_id, "Questo sondaggio è chiuso e non può più essere modificato.")
-        return
-    form_url = request.host_url.rstrip("/") + f"/api/pollform?edit={raw}"
-    keyboard = {"inline_keyboard": [[{"text": "✏️ Modifica sondaggio", "web_app": {"url": form_url}}]]}
-    send_message(chat_id, f"Tocca il bottone per modificare il sondaggio #{raw}:", keyboard)
+def edit_form_url(id_str: str) -> str:
+    """URL della Web App in modalità modifica per un sondaggio o un modello
+    ricorrente (funziona con entrambi, id_str può essere 'R5' o '5')."""
+    return request.host_url.rstrip("/") + f"/api/pollform?edit={id_str}"
 
 
 # ================= COMANDI (chat privata) =================
@@ -428,7 +423,7 @@ def cmd_start(chat_id, user_id, args):
             send_message(chat_id, "Questo sondaggio non è più disponibile per la condivisione.")
             return
         keyboard = {"inline_keyboard": [[
-            {"text": "↗️ Scegli dove condividerlo", "switch_inline_query": poll_id}
+            {"text": "↗️ Scegli dove condividerlo", "switch_inline_query": f"share|{poll_id}"}
         ]]}
         send_message(chat_id, f"Tocca il bottone per scegliere in quale chat condividere:\n\n"
                                f"«{poll['question']}»", keyboard)
@@ -532,7 +527,7 @@ def cmd_polls(chat_id, user_id):
         else:
             text = pad_for_width(f"📊 {p['question']}")
             keyboard = {"inline_keyboard": [[
-                {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{pid}"},
+                {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(pid)}},
                 {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
                 {"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"},
             ]]}
@@ -544,10 +539,10 @@ def cmd_polls(chat_id, user_id):
             continue
         rid = f"R{tid}"
         first_line = pad_for_width(
-            f"📅 Sondaggio Scadenziario (ogni {WEEKDAY_NAMES[t['weekday']]} alle {t.get('hour', 9):02d}:00)")
+            f"📅 Sondaggio scadenziato (ogni {WEEKDAY_NAMES[t['weekday']]})")
         text = f"{first_line}\n{t['question']}"
         keyboard = {"inline_keyboard": [[
-            {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{rid}"},
+            {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(rid)}},
             {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{rid}"},
         ]]}
         send_message(chat_id, text, keyboard)
@@ -613,8 +608,12 @@ def handle_poll_edit(chat_id, user_id, payload):
     poll["allow_external_share"] = bool(payload.get("allow_external_share"))
 
     set_json(f"poll:{poll_id}", poll)
-    sync_poll(poll)
-    send_message(chat_id, "✅ Sondaggio aggiornato nel canale.")
+    if poll.get("locations"):
+        sync_poll(poll)
+        send_message(chat_id, "✅ Sondaggio aggiornato.")
+    else:
+        # È ancora una bozza non pubblicata: si torna alla preview.
+        send_message(chat_id, build_text(poll), build_preview_keyboard(poll_id), parse_mode="HTML")
     return True, "Sondaggio aggiornato."
 
 
@@ -640,12 +639,6 @@ def handle_template_edit(chat_id, user_id, payload):
         return False, "Giorno della settimana non valido."
     weekday = int(weekday)
 
-    hour = payload.get("hour")
-    if hour is None or not (0 <= int(hour) <= 23):
-        send_message(chat_id, "Orario non valido. Modifica annullata.")
-        return False, "Orario non valido."
-    hour = int(hour)
-
     old_weekday = tpl["weekday"]
     tpl["question"] = question
     tpl["options"] = new_options
@@ -658,15 +651,15 @@ def handle_template_edit(chat_id, user_id, payload):
     tpl["allow_suggestions"] = bool(payload.get("allow_suggestions"))
     tpl["allow_external_share"] = bool(payload.get("allow_external_share"))
     tpl["weekday"] = weekday
-    tpl["hour"] = hour
 
     set_json(f"template:{tpl_id}", tpl)
     if weekday != old_weekday:
         redis.srem(f"templates_by_day:{old_weekday}", tpl_id)
         redis.sadd(f"templates_by_day:{weekday}", tpl_id)
 
-    send_message(chat_id, f"✅ Sondaggio ricorrente aggiornato (ogni {WEEKDAY_NAMES[weekday]} alle {hour:02d}:00).")
+    send_message(chat_id, f"✅ Sondaggio ricorrente aggiornato (ogni {WEEKDAY_NAMES[weekday]}).")
     return True, "Sondaggio ricorrente aggiornato."
+
 
 
 def handle_web_app_data(chat_id, user_id, payload):
@@ -702,23 +695,17 @@ def handle_web_app_data(chat_id, user_id, payload):
 
     if payload.get("recurrent"):
         weekday = payload.get("weekday")
-        hour = payload.get("hour")
         if weekday is None or not (0 <= int(weekday) <= 6):
             return False, "Giorno della settimana non valido."
-        if hour is None or not (0 <= int(hour) <= 23):
-            return False, "Orario non valido."
-        tpl_id = save_template(fields, int(weekday), int(hour), chat_id)
+        tpl_id = save_template(fields, int(weekday), chat_id)
         send_message(chat_id, f"✅ Sondaggio ricorrente salvato (#R{tpl_id}).\n"
-                               f"Ogni {WEEKDAY_NAMES[int(weekday)]} alle {int(hour):02d}:00 riceverai un promemoria "
-                               f"con un bottone per pubblicarlo nel canale.")
+                               f"Ogni {WEEKDAY_NAMES[int(weekday)]} mattina (circa le 9) riceverai un promemoria "
+                               f"con un bottone per rivederlo e scegliere dove pubblicarlo.")
         return True, "Sondaggio ricorrente salvato."
     else:
-        poll, err = publish_poll(fields)
-        if not poll:
-            send_message(chat_id, f"❌ Telegram ha rifiutato la pubblicazione: {err}")
-            return False, f"Telegram ha rifiutato la pubblicazione: {err}"
-        send_message(chat_id, "✅ Sondaggio pubblicato nel canale.")
-        return True, "Sondaggio pubblicato."
+        poll = create_draft(fields, chat_id)
+        send_message(chat_id, build_text(poll), build_preview_keyboard(poll["id"]), parse_mode="HTML")
+        return True, "Bozza pronta: rivedila e pubblicala."
 
 
 # ================= CALLBACK: VOTO E RICORRENTI =================
@@ -731,12 +718,8 @@ def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
     if not tpl:
         answer_callback(callback_id, "Modello non più disponibile.", alert=True)
         return
-    poll, err = publish_poll(extract_fields(tpl))
-    if not poll:
-        edit_message(chat_id, message_id, f"❌ Telegram ha rifiutato la pubblicazione: {err}")
-        answer_callback(callback_id, "Errore nella pubblicazione.", alert=True)
-        return
-    edit_message(chat_id, message_id, f"✅ Sondaggio pubblicato nel canale (dal modello #R{tpl_id}).")
+    poll = create_draft(extract_fields(tpl), chat_id)
+    edit_message(chat_id, message_id, build_text(poll), build_preview_keyboard(poll["id"]), parse_mode="HTML")
     answer_callback(callback_id)
 
 
@@ -752,10 +735,7 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
         if not tpl:
             answer_callback(callback_id, "Modello non trovato.", alert=True)
             return
-        if action == "edit":
-            open_edit_webapp(chat_id, item_id)
-            answer_callback(callback_id)
-        elif action == "delete":
+        if action == "delete":
             delete_template_completely(raw, tpl)
             edit_message(chat_id, message_id, "🗑️ Sondaggio ricorrente eliminato.")
             answer_callback(callback_id, "Eliminato.")
@@ -768,11 +748,7 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
         answer_callback(callback_id, "Sondaggio non trovato.", alert=True)
         return
 
-    if action == "edit":
-        open_edit_webapp(chat_id, item_id)
-        answer_callback(callback_id)
-
-    elif action == "log":
+    if action == "log":
         send_message(chat_id, build_log_text(raw))
         answer_callback(callback_id)
 
@@ -790,7 +766,7 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
         reopen_poll(raw, poll)
         text = pad_for_width(f"📊 {poll['question']}")
         edit_message(chat_id, message_id, text, {"inline_keyboard": [[
-            {"text": "✏️ Modifica", "callback_data": f"mgmt|edit|{raw}"},
+            {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(raw)}},
             {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
             {"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"},
         ]]})
@@ -850,39 +826,79 @@ def plain_preview(raw: str, limit: int = 60) -> str:
 def handle_inline_query(iq: dict):
     query_id = iq["id"]
     query_text = (iq.get("query") or "").strip()
-    poll = get_json(f"poll:{query_text}") if query_text else None
 
-    if not poll or poll.get("closed") or not poll.get("allow_external_share"):
+    if "|" not in query_text:
         tg("answerInlineQuery", inline_query_id=query_id, results=[])
         return
+    mode, item_id = query_text.split("|", 1)
+    poll = get_json(f"poll:{item_id}")
 
-    result = {
-        "type": "article",
-        "id": poll["id"],
-        "title": plain_preview(poll["question"]) or "Sondaggio",
-        "description": "Tocca per condividere questo sondaggio qui: resta sincronizzato con il canale",
-        "input_message_content": {
-            "message_text": build_text(poll),
-            "parse_mode": "HTML",
-        },
-        "reply_markup": build_keyboard(poll),
-    }
-    tg("answerInlineQuery", inline_query_id=query_id, results=[result], cache_time=0)
+    if mode == "pub":
+        # Prima pubblicazione di una bozza: deve esistere e non essere già
+        # stata pubblicata da nessuna parte (evita doppie pubblicazioni se
+        # si preme "Pubblica" due volte).
+        if not poll or poll.get("locations"):
+            tg("answerInlineQuery", inline_query_id=query_id, results=[])
+            return
+        result = {
+            "type": "article",
+            "id": f"pub|{item_id}",
+            "title": plain_preview(poll["question"]) or "Sondaggio",
+            "description": "Pubblica il sondaggio in questa chat",
+            "input_message_content": {"message_text": build_text(poll), "parse_mode": "HTML"},
+            "reply_markup": build_keyboard(poll),
+        }
+        tg("answerInlineQuery", inline_query_id=query_id, results=[result], cache_time=0)
+        return
+
+    if mode == "share":
+        # Condivisione di un sondaggio già pubblicato altrove.
+        if not poll or poll.get("closed") or not poll.get("locations") or not poll.get("allow_external_share"):
+            tg("answerInlineQuery", inline_query_id=query_id, results=[])
+            return
+        result = {
+            "type": "article",
+            "id": f"share|{item_id}",
+            "title": plain_preview(poll["question"]) or "Sondaggio",
+            "description": "Tocca per condividere questo sondaggio qui: resta sincronizzato",
+            "input_message_content": {"message_text": build_text(poll), "parse_mode": "HTML"},
+            "reply_markup": build_keyboard(poll),
+        }
+        tg("answerInlineQuery", inline_query_id=query_id, results=[result], cache_time=0)
+        return
+
+    tg("answerInlineQuery", inline_query_id=query_id, results=[])
 
 
 def handle_chosen_inline_result(cir: dict):
-    poll_id = cir.get("result_id")
+    query = cir.get("query", "")
     inline_message_id = cir.get("inline_message_id")
-    if not poll_id or not inline_message_id:
+    if not inline_message_id or "|" not in query:
         return
-    poll = get_json(f"poll:{poll_id}")
+    mode, item_id = query.split("|", 1)
+    poll = get_json(f"poll:{item_id}")
     if not poll:
         return
-    ids = poll.get("inline_message_ids", [])
-    if inline_message_id not in ids:
-        ids.append(inline_message_id)
-        poll["inline_message_ids"] = ids
-        set_json(f"poll:{poll_id}", poll)
+
+    if mode == "pub":
+        locations = poll.get("locations", [])
+        if inline_message_id not in locations:
+            locations.append(inline_message_id)
+        first_time = not poll.get("locations")
+        poll["locations"] = locations
+        set_json(f"poll:{item_id}", poll)
+        if first_time:
+            redis.sadd("polls_index", item_id)
+        creator_chat_id = poll.get("creator_chat_id")
+        if creator_chat_id:
+            send_message(creator_chat_id, "✅ Sondaggio pubblicato!")
+
+    elif mode == "share":
+        locations = poll.get("locations", [])
+        if inline_message_id not in locations:
+            locations.append(inline_message_id)
+            poll["locations"] = locations
+            set_json(f"poll:{item_id}", poll)
 
 
 def ensure_commands_registered():
@@ -1001,7 +1017,7 @@ POLLFORM_HTML = """<!DOCTYPE html>
     border: none; outline: none; font-size: 16px; width: 100%; background: transparent;
     color: var(--text); font-family: inherit; resize: none;
   }
-  textarea { min-height: 44px; }
+  textarea { min-height: 44px; max-height: 220px; overflow-y: auto; }
   ::placeholder { color: var(--hint); }
   .opt-row { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--separator); }
   .opt-remove { color: #ff3b30; font-size: 20px; line-height: 1; cursor: pointer; padding: 4px; }
@@ -1098,22 +1114,7 @@ POLLFORM_HTML = """<!DOCTYPE html>
       <option value="5">Ogni Sabato</option>
       <option value="6">Ogni Domenica</option>
     </select>
-    <select id="hour">
-      <option value="0">00:00</option><option value="1">01:00</option>
-      <option value="2">02:00</option><option value="3">03:00</option>
-      <option value="4">04:00</option><option value="5">05:00</option>
-      <option value="6">06:00</option><option value="7">07:00</option>
-      <option value="8">08:00</option><option value="9" selected>09:00</option>
-      <option value="10">10:00</option><option value="11">11:00</option>
-      <option value="12">12:00</option><option value="13">13:00</option>
-      <option value="14">14:00</option><option value="15">15:00</option>
-      <option value="16">16:00</option><option value="17">17:00</option>
-      <option value="18">18:00</option><option value="19">19:00</option>
-      <option value="20">20:00</option><option value="21">21:00</option>
-      <option value="22">22:00</option><option value="23">23:00</option>
-    </select>
   </div>
-  <div class="hint" style="padding-bottom:12px">Orario di Roma. Il promemoria arriva entro la mezz'ora successiva.</div>
 </div>
 
 <script>
@@ -1192,13 +1193,13 @@ if (editId) {
         document.getElementById('recurrentToggleRow').style.display = 'none';
         document.getElementById('weekdayRow').style.display = 'flex';
         document.getElementById('weekday').value = String(p.weekday);
-        document.getElementById('hour').value = String(p.hour != null ? p.hour : 9);
       } else {
         document.querySelector('.topbar h1').textContent = 'Modifica sondaggio';
         document.getElementById('recurrentCard').style.display = 'none';
       }
 
       document.getElementById('question').value = p.question || '';
+      autoGrow(document.getElementById('question'));
       (p.options || []).forEach(o => addOption(o));
       document.getElementById('showVoters').checked = !p.anonymous;
       document.getElementById('multiple').checked = !!p.multiple;
@@ -1206,6 +1207,7 @@ if (editId) {
       document.getElementById('allowSuggestions').checked = !!p.allow_suggestions;
       document.getElementById('allowExternalShare').checked = !!p.allow_external_share;
       document.getElementById('explanation').value = p.explanation || '';
+      autoGrow(document.getElementById('explanation'));
       quizToggle.checked = !!p.quiz;
       quizToggle.dispatchEvent(new Event('change'));
       if (p.quiz && p.correct_index !== null && p.correct_index !== undefined) {
@@ -1261,6 +1263,15 @@ document.getElementById('linkInsert').onclick = () => {
   validate();
 };
 
+function autoGrow(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 220) + 'px';
+}
+['question', 'explanation'].forEach(id => {
+  const el = document.getElementById(id);
+  el.addEventListener('input', () => autoGrow(el));
+});
+
 document.getElementById('question').addEventListener('input', validate);
 
 function validate() {
@@ -1300,9 +1311,6 @@ document.getElementById('createBtn').addEventListener('click', () => {
     weekday: isTemplateEdit
       ? parseInt(document.getElementById('weekday').value, 10)
       : ((!editId && recurrentToggle.checked) ? parseInt(document.getElementById('weekday').value, 10) : null),
-    hour: isTemplateEdit
-      ? parseInt(document.getElementById('hour').value, 10)
-      : ((!editId && recurrentToggle.checked) ? parseInt(document.getElementById('hour').value, 10) : null),
   };
 
   fetch('/api/submitpoll', {
@@ -1374,7 +1382,6 @@ def pollformdata():
             "allow_suggestions": tpl.get("allow_suggestions", False),
             "allow_external_share": tpl.get("allow_external_share", False),
             "weekday": tpl["weekday"],
-            "hour": tpl.get("hour", 9),
         }}
 
     poll = get_json(f"poll:{raw}")
@@ -1396,17 +1403,9 @@ def pollformdata():
 
 # ================= ENDPOINT CRON (promemoria settimanale) =================
 #
-# NOTA SULLA FREQUENZA: il piano gratuito di Vercel permette al massimo un
-# cron nativo al giorno, quindi da solo non basta per rispettare un orario
-# scelto liberamente per ogni sondaggio ricorrente. Per far funzionare
-# davvero la selezione dell'orario, questo endpoint va chiamato più spesso
-# (ogni 15-30 minuti) tramite un servizio esterno gratuito (es. cron-job.org)
-# che invii una richiesta GET con l'header:
-#     Authorization: Bearer <CRON_SECRET>
-# (il valore di CRON_SECRET si trova nelle Environment Variables del
-# progetto su Vercel). Il cron nativo di Vercel può restare comunque
-# attivo come ulteriore rete di sicurezza: le chiamate ripetute non fanno
-# danni, grazie al controllo anti-doppio-invio più sotto.
+# Il cron gira una volta al giorno tramite Vercel (vedi vercel.json,
+# "0 8 * * *" = 08:00 UTC, circa le 9 del mattino a Roma) e manda i
+# promemoria dei sondaggi ricorrenti previsti per il giorno corrente.
 
 @app.route("/api/cron", methods=["GET"])
 def cron():
@@ -1426,13 +1425,12 @@ def cron():
             if poll["closed"]:
                 closed_now += 1
 
-    # 2) Promemoria per i sondaggi ricorrenti il cui giorno E orario
-    # (fuso di Roma) coincidono con l'orario attuale di questa chiamata.
-    # Il controllo anti-doppio-invio evita che, chiamando questo endpoint
-    # più volte nella stessa ora, lo stesso promemoria parta più volte.
+    # 2) Promemoria per i sondaggi ricorrenti previsti per il giorno
+    # corrente (fuso di Roma). Il controllo anti-doppio-invio evita che,
+    # in caso di chiamate ripetute nello stesso giorno, lo stesso
+    # promemoria parta più volte.
     now = now_rome()
     today = now.weekday()
-    current_hour = now.hour
     date_str = now.strftime("%Y-%m-%d")
 
     tpl_ids = redis.smembers(f"templates_by_day:{today}") or []
@@ -1441,7 +1439,7 @@ def cron():
         admin_chats = redis.smembers("admin_chats") or []
         for tid in tpl_ids:
             tpl = get_json(f"template:{tid}")
-            if not tpl or tpl.get("hour", 9) != current_hour:
+            if not tpl:
                 continue
             dedup_key = f"reminder_sent:{tid}:{date_str}"
             if redis.get(dedup_key):
