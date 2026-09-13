@@ -252,8 +252,7 @@ def remember_admin_chat(user_id: int, chat_id: int):
 
 def build_text(poll: dict) -> str:
     """Genera il testo del messaggio in HTML (Telegram parse_mode=HTML)."""
-    icon = "🧠" if poll["quiz"] else "📊"
-    lines = [f"{icon} {format_rich_text(poll['question'])}", ""]
+    lines = [format_rich_text(poll['question']), ""]
     for i, opt in enumerate(poll["options"]):
         voters = [v["name"] for v in poll["votes"].values() if i in v["choices"]]
         mark = "✅ " if poll["quiz"] and i == poll["correct_index"] and poll["closed"] else ""
@@ -453,6 +452,21 @@ def cmd_deladmin(chat_id, user_id, args):
     send_message(chat_id, f"🗑️ Utente {args[0]} rimosso dagli amministratori del bot.")
 
 
+def get_display_name(uid) -> str:
+    """Nickname Telegram (@username) di un utente a partire dal suo ID,
+    con ripiego sul nome visualizzato o sull'ID stesso se non disponibile."""
+    res = tg("getChat", chat_id=str(uid))
+    if res.get("ok"):
+        c = res["result"]
+        if c.get("username"):
+            return f"@{c['username']}"
+        name = c.get("first_name", "")
+        if c.get("last_name"):
+            name += f" {c['last_name']}"
+        return name or f"ID {uid}"
+    return f"ID {uid}"
+
+
 def cmd_admins(chat_id, user_id):
     if not is_bot_admin(user_id):
         send_message(chat_id, "Comando riservato agli amministratori del bot.")
@@ -464,14 +478,14 @@ def cmd_admins(chat_id, user_id):
         return
 
     for uid in sorted(INITIAL_ADMIN_IDS):
-        text = pad_for_width("🔒 Amministratore fisso") + f"\nID: {uid}"
+        text = pad_for_width("🔒 Amministratore fisso") + f"\n{get_display_name(uid)}"
         keyboard = {"inline_keyboard": [[
             {"text": "🔒 Non rimovibile da qui", "callback_data": f"admdel|fixed|{uid}"}
         ]]}
         send_message(chat_id, text, keyboard)
 
     for uid in dynamic_ids:
-        text = pad_for_width("👤 Amministratore") + f"\nID: {uid}"
+        text = pad_for_width("👤 Amministratore") + f"\n{get_display_name(uid)}"
         keyboard = {"inline_keyboard": [[
             {"text": "🗑️ Rimuovi", "callback_data": f"admdel|remove|{uid}"}
         ]]}
