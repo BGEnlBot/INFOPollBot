@@ -384,7 +384,7 @@ def delete_template_completely(tpl_id: str, tpl: dict):
 
 POLL_FIELD_KEYS = ("question", "options", "multiple", "anonymous", "quiz",
                     "allow_revote", "correct_index", "explanation",
-                    "allow_suggestions", "allow_external_share")
+                    "allow_suggestions")
 
 
 def extract_fields(payload: dict) -> dict:
@@ -557,11 +557,13 @@ def cmd_start(chat_id, user_id, args, from_user):
         return
 
     name = f"@{from_user['username']}" if from_user.get("username") else from_user.get("first_name", "")
-    send_message(chat_id, f"Benvenuto {name}, cosa posso fare per te oggi?\n\n"
-                           "/newpoll - crea un sondaggio\n"
-                           "/polls - gestisci sondaggi e ricorrenti (modifica, chiudi, riapri, elimina, log, condividi)\n"
-                           "/admins - elenco amministratori del bot",
-                 reply_markup={"remove_keyboard": True})
+    form_url = request.host_url.rstrip("/") + "/api/pollform"
+    keyboard = {"inline_keyboard": [
+        [{"text": "📊 Crea un sondaggio", "web_app": {"url": form_url}}],
+        [{"text": "🗂 Gestisci i sondaggi", "callback_data": "startmenu|polls"}],
+        [{"text": "👥 Elenco amministratori del bot", "callback_data": "startmenu|admins"}],
+    ]}
+    send_message(chat_id, pad_first_line(f"Benvenuto {name}, cosa posso fare per te oggi?"), keyboard)
 
 
 def handle_option_suggestion(chat_id, user_id, text):
@@ -600,7 +602,7 @@ def cmd_newpoll(chat_id, user_id):
     remember_admin_chat(user_id, chat_id)
     form_url = request.host_url.rstrip("/") + "/api/pollform"
     keyboard = {"inline_keyboard": [[{"text": "📊 Crea sondaggio", "web_app": {"url": form_url}}]]}
-    send_message(chat_id, "Tocca il bottone per aprire la creazione del sondaggio:", keyboard)
+    send_message(chat_id, pad_for_width("📊 Nuovo sondaggio"), keyboard)
 
 
 def build_log_text(poll_id: str) -> str:
@@ -630,6 +632,15 @@ def pad_for_width(line: str, min_len: int = 42) -> str:
     return line if len(line) >= min_len else line + " " * (min_len - len(line))
 
 
+def pad_first_line(full_text: str, min_len: int = 42) -> str:
+    """Come pad_for_width, ma per un testo che può avere più righe:
+    allarga solo la prima, lasciando invariato il resto."""
+    if "\n" in full_text:
+        first, rest = full_text.split("\n", 1)
+        return pad_for_width(first, min_len) + "\n" + rest
+    return pad_for_width(full_text, min_len)
+
+
 def cmd_polls(chat_id, user_id):
     if not is_bot_admin(user_id):
         send_message(chat_id, "Comando riservato agli amministratori del bot.")
@@ -655,16 +666,16 @@ def cmd_polls(chat_id, user_id):
             ]]}
         else:
             text = pad_for_width(f"📊 {p['question']}")
-            keyboard_rows = [[
-                {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(pid)}},
-                {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
-                {"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"},
-            ]]
-            if p.get("allow_external_share"):
-                keyboard_rows.append([
-                    {"text": "↗️ Condividi in un'altra chat", "switch_inline_query": f"share|{pid}"}
-                ])
-            keyboard = {"inline_keyboard": keyboard_rows}
+            keyboard = {"inline_keyboard": [
+                [
+                    {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(pid)}},
+                    {"text": "↗️ Condividi", "switch_inline_query": f"share|{pid}"},
+                ],
+                [
+                    {"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"},
+                    {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
+                ],
+            ]}
         send_message(chat_id, text, keyboard)
 
     for tid in tpl_ids:
@@ -739,7 +750,6 @@ def handle_poll_edit(chat_id, user_id, payload):
     poll["correct_index"] = payload.get("correct_index")
     poll["explanation"] = (payload.get("explanation") or "").strip()
     poll["allow_suggestions"] = bool(payload.get("allow_suggestions"))
-    poll["allow_external_share"] = bool(payload.get("allow_external_share"))
 
     set_json(f"poll:{poll_id}", poll)
     if poll.get("locations"):
@@ -747,7 +757,7 @@ def handle_poll_edit(chat_id, user_id, payload):
         send_message(chat_id, "✅ Sondaggio aggiornato.")
     else:
         # È ancora una bozza non pubblicata: si torna alla preview.
-        send_message(chat_id, build_text(poll), build_preview_keyboard(poll), parse_mode="HTML")
+        send_message(chat_id, pad_first_line(build_text(poll)), build_preview_keyboard(poll), parse_mode="HTML")
     return True, "Sondaggio aggiornato."
 
 
@@ -783,7 +793,6 @@ def handle_template_edit(chat_id, user_id, payload):
     tpl["correct_index"] = payload.get("correct_index")
     tpl["explanation"] = (payload.get("explanation") or "").strip()
     tpl["allow_suggestions"] = bool(payload.get("allow_suggestions"))
-    tpl["allow_external_share"] = bool(payload.get("allow_external_share"))
     tpl["weekday"] = weekday
 
     set_json(f"template:{tpl_id}", tpl)
@@ -824,7 +833,6 @@ def handle_web_app_data(chat_id, user_id, payload):
         "correct_index": payload.get("correct_index"),
         "explanation": (payload.get("explanation") or "").strip(),
         "allow_suggestions": bool(payload.get("allow_suggestions")),
-        "allow_external_share": bool(payload.get("allow_external_share")),
     }
 
     if payload.get("recurrent"):
@@ -838,7 +846,7 @@ def handle_web_app_data(chat_id, user_id, payload):
         return True, "Sondaggio ricorrente salvato."
     else:
         poll = create_draft(fields, chat_id)
-        send_message(chat_id, build_text(poll), build_preview_keyboard(poll), parse_mode="HTML")
+        send_message(chat_id, pad_first_line(build_text(poll)), build_preview_keyboard(poll), parse_mode="HTML")
         return True, "Bozza pronta: rivedila e pubblicala."
 
 
@@ -853,7 +861,7 @@ def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
         answer_callback(callback_id, "Modello non più disponibile.", alert=True)
         return
     poll = create_draft(extract_fields(tpl), chat_id)
-    edit_message(chat_id, message_id, build_text(poll), build_preview_keyboard(poll), parse_mode="HTML")
+    edit_message(chat_id, message_id, pad_first_line(build_text(poll)), build_preview_keyboard(poll), parse_mode="HTML")
     answer_callback(callback_id)
 
 
@@ -899,13 +907,16 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
     elif action == "reopen":
         reopen_poll(raw, poll)
         text = pad_for_width(f"📊 {poll['question']}")
-        rows = [[
-            {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(raw)}},
-            {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
-            {"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"},
-        ]]
-        if poll.get("allow_external_share"):
-            rows.append([{"text": "↗️ Condividi in un'altra chat", "switch_inline_query": f"share|{raw}"}])
+        rows = [
+            [
+                {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(raw)}},
+                {"text": "↗️ Condividi", "switch_inline_query": f"share|{raw}"},
+            ],
+            [
+                {"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"},
+                {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
+            ],
+        ]
         edit_message(chat_id, message_id, text, {"inline_keyboard": rows})
         answer_callback(callback_id, "Sondaggio riaperto.")
 
@@ -990,7 +1001,7 @@ def handle_inline_query(iq: dict):
 
     if mode == "share":
         # Condivisione di un sondaggio già pubblicato altrove.
-        if not poll or poll.get("closed") or not poll.get("locations") or not poll.get("allow_external_share"):
+        if not poll or poll.get("closed") or not poll.get("locations"):
             tg("answerInlineQuery", inline_query_id=query_id, results=[])
             return
         result = {
@@ -1114,6 +1125,16 @@ def webhook():
                                     msg_ref["message_id"], action, target_uid)
         elif data == "admadd" and msg_ref:
             handle_admadd_callback(callback_id, user["id"], msg_ref["chat"]["id"])
+        elif data.startswith("startmenu|") and msg_ref:
+            action = data.split("|", 1)[1]
+            if not is_bot_admin(user["id"]):
+                answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
+            else:
+                if action == "polls":
+                    cmd_polls(msg_ref["chat"]["id"], user["id"])
+                elif action == "admins":
+                    cmd_admins(msg_ref["chat"]["id"], user["id"])
+                answer_callback(callback_id)
         elif data.startswith("vote|"):
             _, poll_id, idx = data.split("|")
             handle_vote_callback(callback_id, user, poll_id, int(idx))
@@ -1247,10 +1268,6 @@ POLLFORM_HTML = """<!DOCTYPE html>
     <div class="setting-text"><b>Consenti di inserire opzioni</b><span>Gli utenti possono proporre nuove opzioni scrivendo al bot</span></div>
     <label class="switch"><input type="checkbox" id="allowSuggestions"><span class="slider"></span></label>
   </div>
-  <div class="setting-row">
-    <div class="setting-text"><b>Condivisione esterna</b><span>Può essere condiviso e votato anche fuori dal canale, restando sincronizzato</span></div>
-    <label class="switch"><input type="checkbox" id="allowExternalShare"><span class="slider"></span></label>
-  </div>
   <div class="row" id="explanationRow" style="display:none">
     <textarea id="explanation" placeholder="Spiegazione mostrata a chiusura (opzionale)" rows="2"></textarea>
   </div>
@@ -1362,7 +1379,6 @@ if (editId) {
       document.getElementById('multiple').checked = !!p.multiple;
       document.getElementById('allowRevote').checked = !!p.allow_revote;
       document.getElementById('allowSuggestions').checked = !!p.allow_suggestions;
-      document.getElementById('allowExternalShare').checked = !!p.allow_external_share;
       document.getElementById('explanation').value = p.explanation || '';
       autoGrow(document.getElementById('explanation'));
       quizToggle.checked = !!p.quiz;
@@ -1463,7 +1479,6 @@ document.getElementById('createBtn').addEventListener('click', () => {
     correct_index: correct_index,
     explanation: document.getElementById('explanation').value.trim(),
     allow_suggestions: document.getElementById('allowSuggestions').checked,
-    allow_external_share: document.getElementById('allowExternalShare').checked,
     recurrent: (!editId) ? recurrentToggle.checked : false,
     weekday: isTemplateEdit
       ? parseInt(document.getElementById('weekday').value, 10)
@@ -1537,7 +1552,6 @@ def pollformdata():
             "correct_index": tpl["correct_index"],
             "explanation": tpl.get("explanation", ""),
             "allow_suggestions": tpl.get("allow_suggestions", False),
-            "allow_external_share": tpl.get("allow_external_share", False),
             "weekday": tpl["weekday"],
         }}
 
@@ -1554,7 +1568,6 @@ def pollformdata():
         "correct_index": poll["correct_index"],
         "explanation": poll.get("explanation", ""),
         "allow_suggestions": poll.get("allow_suggestions", False),
-        "allow_external_share": poll.get("allow_external_share", False),
     }}
 
 
@@ -1604,7 +1617,8 @@ def cron():
             keyboard = {"inline_keyboard": [[
                 {"text": "✅ Crea sondaggio ora", "callback_data": f"recur|{tid}"}
             ]]}
-            text = f"📅 Promemoria: è il momento di pubblicare il sondaggio ricorrente #R{tid}:\n\n{tpl['question']}"
+            text = pad_first_line(
+                f"📅 Promemoria: è il momento di pubblicare il sondaggio ricorrente #R{tid}:\n\n{tpl['question']}")
             for entry in admin_chats:
                 uid_str, chat_id_str = entry.split(":")
                 if is_bot_admin(int(uid_str)):
