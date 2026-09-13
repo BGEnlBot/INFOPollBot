@@ -625,19 +625,17 @@ def build_log_text(poll_id: str) -> str:
     return "\n".join(lines).strip()
 
 
-def pad_for_width(line: str, min_len: int = 24) -> str:
-    """Allarga la prima riga del messaggio (con spazi unificatori U+2003
-    finali, poco soggetti a essere "tagliati" nel calcolo della larghezza
-    a differenza dello spazio normale) così Telegram disegna una bolla
-    più larga e i bottoni ci stanno comodamente sulla stessa riga invece
-    di essere compressi. Il valore è scelto abbastanza alto da puntare
-    alla larghezza massima della bolla su schermo, così tutti i messaggi
-    con bottoni risultano larghi allo stesso modo, indipendentemente
-    dalla lunghezza del testo reale."""
-    return line if len(line) >= min_len else line + "\u2003" * (min_len - len(line))
+def pad_for_width(line: str, min_len: int = 50) -> str:
+    """Allarga la prima riga del messaggio ripetendo un carattere "braille
+    vuoto" (U+2800): a differenza dello spazio normale, questo non è
+    classificato come spazio bianco a livello tecnico, quindi ha meno
+    probabilità di essere tagliato quando Telegram calcola la larghezza
+    della bolla — ma resta comunque un trucco non documentato
+    ufficialmente da Telegram, quindi va verificato "a vista"."""
+    return line if len(line) >= min_len else line + "\u2800" * (min_len - len(line))
 
 
-def pad_first_line(full_text: str, min_len: int = 24) -> str:
+def pad_first_line(full_text: str, min_len: int = 50) -> str:
     """Come pad_for_width, ma per un testo che può avere più righe:
     allarga solo la prima, lasciando invariato il resto."""
     if "\n" in full_text:
@@ -1067,7 +1065,7 @@ def ensure_commands_registered():
     partire /polls o /admins senza bisogno di scriverli). La chiave è
     "versionata": cambiandola si forza una ri-registrazione se questa
     configurazione cambia di nuovo in futuro."""
-    if redis.get("commands_registered_v5"):
+    if redis.get("commands_registered_v6"):
         return
     tg("setMyCommands", commands=[
         {"command": "newpoll", "description": "📊 Crea un sondaggio"},
@@ -1078,7 +1076,7 @@ def ensure_commands_registered():
     tg("setChatMenuButton", menu_button={
         "type": "web_app", "text": "Menu", "web_app": {"url": launcher_url}
     })
-    redis.set("commands_registered_v5", "1")
+    redis.set("commands_registered_v6", "1")
 
 
 @app.route("/api/webhook", methods=["POST"])
@@ -1558,7 +1556,8 @@ def submitpoll():
 
 @app.route("/api/pollform", methods=["GET"])
 def pollform():
-    return POLLFORM_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+    return POLLFORM_HTML, 200, {"Content-Type": "text/html; charset=utf-8",
+                                 "Cache-Control": "no-store, must-revalidate"}
 
 
 LAUNCHER_HTML = """<!DOCTYPE html>
@@ -1631,7 +1630,8 @@ document.getElementById('btnAdmins').addEventListener('click', () => {
 
 @app.route("/api/launcher", methods=["GET"])
 def launcher():
-    return LAUNCHER_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+    return LAUNCHER_HTML, 200, {"Content-Type": "text/html; charset=utf-8",
+                                 "Cache-Control": "no-store, must-revalidate"}
 
 
 @app.route("/api/pollformdata", methods=["GET"])
