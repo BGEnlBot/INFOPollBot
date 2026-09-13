@@ -400,17 +400,42 @@ def edit_form_url(id_str: str) -> str:
 
 # ================= COMANDI (chat privata) =================
 
+def resolve_user_id(raw: str):
+    """
+    Accetta un ID numerico o uno @username e ritorna (id, errore).
+    Per lo username funziona SOLO se quella persona ha già scritto
+    almeno un messaggio al bot in passato: è un limite di Telegram
+    stesso (i bot non possono cercare utenti mai visti prima), non
+    aggirabile lato codice.
+    """
+    raw = raw.strip()
+    if raw.isdigit():
+        return raw, None
+
+    username = raw.lstrip("@")
+    res = tg("getChat", chat_id=f"@{username}")
+    if not res.get("ok") or res.get("result", {}).get("type") != "private":
+        return None, (f"Non trovo @{username}. Questo funziona solo se quella persona ha già "
+                       f"scritto almeno un messaggio al bot (anche solo /start). "
+                       f"In alternativa, chiedile il suo ID numerico su @userinfobot.")
+    return str(res["result"]["id"]), None
+
+
 def cmd_addadmin(chat_id, user_id, args):
     if not is_bot_admin(user_id):
         send_message(chat_id, "Comando riservato agli amministratori del bot.")
         return
-    if not args or not args[0].isdigit():
-        send_message(chat_id, "Uso: /addadmin ID_UTENTE\n\n"
-                               "L'utente deve conoscere il proprio ID Telegram numerico "
-                               "(può scoprirlo scrivendo a @userinfobot).")
+    if not args:
+        send_message(chat_id, "Uso: /addadmin ID_UTENTE oppure /addadmin @username\n\n"
+                               "Lo username funziona solo se quella persona ha già scritto "
+                               "al bot almeno una volta.")
         return
-    redis.sadd("bot_admins", args[0])
-    send_message(chat_id, f"✅ Utente {args[0]} aggiunto come amministratore del bot.")
+    new_id, err = resolve_user_id(args[0])
+    if err:
+        send_message(chat_id, err)
+        return
+    redis.sadd("bot_admins", new_id)
+    send_message(chat_id, f"✅ Utente {new_id} aggiunto come amministratore del bot.")
 
 
 def cmd_deladmin(chat_id, user_id, args):
@@ -452,6 +477,9 @@ def cmd_admins(chat_id, user_id):
         ]]}
         send_message(chat_id, text, keyboard)
 
+    send_message(chat_id, pad_for_width("➕ Aggiungi un nuovo amministratore"),
+                 {"inline_keyboard": [[{"text": "➕ Aggiungi amministratore", "callback_data": "admadd"}]]})
+
 
 def handle_admdel_callback(callback_id, user_id, chat_id, message_id, action, target_uid):
     if not is_bot_admin(user_id):
@@ -463,6 +491,31 @@ def handle_admdel_callback(callback_id, user_id, chat_id, message_id, action, ta
     redis.srem("bot_admins", target_uid)
     edit_message(chat_id, message_id, f"🗑️ Amministratore {target_uid} rimosso.")
     answer_callback(callback_id, "Rimosso.")
+
+
+def handle_admadd_callback(callback_id, user_id, chat_id):
+    if not is_bot_admin(user_id):
+        answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
+        return
+    redis.set(f"awaiting_newadmin:{user_id}", "1")
+    send_message(chat_id, "Scrivi lo @username oppure l'ID numerico del nuovo amministratore.\n\n"
+                           "Lo username funziona solo se quella persona ha già scritto al bot "
+                           "almeno una volta (anche solo /start): è un limite di Telegram stesso. "
+                           "In alternativa, l'ID numerico si trova scrivendo a @userinfobot.")
+    answer_callback(callback_id)
+
+
+def handle_newadmin_text(chat_id, user_id, text):
+    if not redis.get(f"awaiting_newadmin:{user_id}"):
+        return False
+    redis.delete(f"awaiting_newadmin:{user_id}")
+    new_id, err = resolve_user_id(text)
+    if err:
+        send_message(chat_id, err)
+        return True
+    redis.sadd("bot_admins", new_id)
+    send_message(chat_id, f"✅ Utente {new_id} aggiunto come amministratore del bot.")
+    return True
 
 
 def cmd_start(chat_id, user_id, args, from_user):
@@ -1014,7 +1067,8 @@ def webhook():
         elif text.startswith("/admins"):
             cmd_admins(chat_id, user_id)
         elif not text.startswith("/"):
-            handle_option_suggestion(chat_id, user_id, text)
+            if not handle_newadmin_text(chat_id, user_id, text):
+                handle_option_suggestion(chat_id, user_id, text)
 
     elif "inline_query" in update:
         handle_inline_query(update["inline_query"])
@@ -1044,6 +1098,8 @@ def webhook():
             _, action, target_uid = data.split("|")
             handle_admdel_callback(callback_id, user["id"], msg_ref["chat"]["id"],
                                     msg_ref["message_id"], action, target_uid)
+        elif data == "admadd" and msg_ref:
+            handle_admadd_callback(callback_id, user["id"], msg_ref["chat"]["id"])
         elif data.startswith("vote|"):
             _, poll_id, idx = data.split("|")
             handle_vote_callback(callback_id, user, poll_id, int(idx))
