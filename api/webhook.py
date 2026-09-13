@@ -625,14 +625,17 @@ def build_log_text(poll_id: str) -> str:
     return "\n".join(lines).strip()
 
 
-def pad_for_width(line: str, min_len: int = 42) -> str:
+def pad_for_width(line: str, min_len: int = 60) -> str:
     """Allarga la prima riga del messaggio (con spazi finali, invisibili)
     così Telegram disegna una bolla più larga e i bottoni ci stanno
-    comodamente sulla stessa riga invece di essere compressi."""
+    comodamente sulla stessa riga invece di essere compressi. Il valore
+    è scelto abbastanza alto da raggiungere la larghezza massima della
+    bolla su schermo, così tutti i messaggi con bottoni risultano larghi
+    allo stesso modo, indipendentemente dalla lunghezza del testo reale."""
     return line if len(line) >= min_len else line + " " * (min_len - len(line))
 
 
-def pad_first_line(full_text: str, min_len: int = 42) -> str:
+def pad_first_line(full_text: str, min_len: int = 60) -> str:
     """Come pad_for_width, ma per un testo che può avere più righe:
     allarga solo la prima, lasciando invariato il resto."""
     if "\n" in full_text:
@@ -1054,17 +1057,23 @@ def handle_chosen_inline_result(cir: dict):
 
 
 def ensure_commands_registered():
-    """Registra il menu comandi di Telegram (icona accanto al campo di
-    scrittura). La chiave è "versionata": cambiandola si forza una
-    ri-registrazione se in futuro la lista comandi cambia di nuovo."""
-    if redis.get("commands_registered_v2"):
+    """Registra il menu comandi di Telegram (icona '/') e imposta il
+    bottone-menu persistente (accanto al campo di scrittura) perché apra
+    direttamente la Web App di creazione sondaggio in un solo tap. La
+    chiave è "versionata": cambiandola si forza una ri-registrazione se
+    in futuro questa configurazione cambia di nuovo."""
+    if redis.get("commands_registered_v3"):
         return
     tg("setMyCommands", commands=[
         {"command": "newpoll", "description": "📊 Crea un sondaggio"},
         {"command": "polls", "description": "🗂 Gestisci i sondaggi"},
         {"command": "admins", "description": "👥 Elenco amministratori del bot"},
     ])
-    redis.set("commands_registered_v2", "1")
+    form_url = request.host_url.rstrip("/") + "/api/pollform"
+    tg("setChatMenuButton", menu_button={
+        "type": "web_app", "text": "Crea sondaggio", "web_app": {"url": form_url}
+    })
+    redis.set("commands_registered_v3", "1")
 
 
 @app.route("/api/webhook", methods=["POST"])
