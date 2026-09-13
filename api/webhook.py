@@ -169,7 +169,11 @@ def get_bot_username() -> str:
 def is_bot_admin(user_id: int) -> bool:
     if user_id in INITIAL_ADMIN_IDS:
         return True
-    return str(user_id) in (redis.smembers("bot_admins") or [])
+    admins = redis.smembers("bot_admins") or []
+    result = str(user_id) in admins
+    print(f"[CHECK ADMIN] user_id={user_id!r} (str={str(user_id)!r}) "
+          f"bot_admins={admins!r} -> {result}", flush=True)
+    return result
 
 
 def validate_init_data(init_data: str, max_age_seconds: int = 86400):
