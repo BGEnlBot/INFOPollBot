@@ -77,7 +77,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 # aggiunti/rimossi dinamicamente con /addadmin e /deladmin.
 INITIAL_ADMIN_IDS = {int(x) for x in os.environ.get("BOT_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
-WEEKDAY_NAMES = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 
 redis = Redis.from_env()
@@ -94,7 +94,7 @@ def handle_unexpected_error(e):
     """
     import traceback
     print(f"[ERRORE NON GESTITO] {traceback.format_exc()}", flush=True)
-    return {"ok": False, "message": f"Errore interno del bot: {e}"}, 500
+    return {"ok": False, "message": f"Internal bot error: {e}"}, 500
 
 
 # ================= HELPER TESTO / HTML =================
@@ -260,20 +260,20 @@ def build_text(poll: dict) -> str:
     for i, opt in enumerate(poll["options"]):
         voters = [v["name"] for v in poll["votes"].values() if i in v["choices"]]
         mark = "✅ " if poll["quiz"] and i == poll["correct_index"] and poll["closed"] else ""
-        lines.append(f"▫️ {mark}{esc(opt)} — {len(voters)} voti")
+        lines.append(f"▫️ {mark}{esc(opt)} — {len(voters)} votes")
         if voters and not poll["anonymous"]:
             lines.append("   " + esc(", ".join(voters)))
     lines.append("")
-    tags = ["anonimo" if poll["anonymous"] else "voti pubblici",
-            "risposte multiple" if poll["multiple"] else "risposta singola"]
+    tags = ["anonymous" if poll["anonymous"] else "public votes",
+            "multiple answers" if poll["multiple"] else "single answer"]
     if poll["quiz"]:
         tags.append("quiz")
     if not poll["allow_revote"]:
-        tags.append("voto non modificabile")
+        tags.append("vote is final")
     lines.append("(" + " • ".join(tags) + ")")
     if poll["closed"]:
         lines.append("")
-        lines.append("🔒 Sondaggio chiuso.")
+        lines.append("🔒 Poll closed.")
         if poll["quiz"] and poll.get("explanation"):
             lines.append(f"ℹ️ {esc(poll['explanation'])}")
     return "\n".join(lines)
@@ -289,7 +289,7 @@ def build_keyboard(poll: dict):
     if poll.get("allow_suggestions") and len(poll["options"]) < 10:
         username = get_bot_username()
         if username:
-            rows.append([{"text": "➕ Proponi un'opzione", "url": f"https://t.me/{username}?start=addopt_{poll['id']}"}])
+            rows.append([{"text": "➕ Suggest an option", "url": f"https://t.me/{username}?start=addopt_{poll['id']}"}])
     return {"inline_keyboard": rows}
 
 
@@ -302,8 +302,8 @@ def build_preview_keyboard(poll: dict):
         [{"text": opt, "callback_data": f"previewnoop|{poll_id}"}]
         for opt in poll["options"]
     ]
-    rows.append([{"text": "✏️ Modifica", "web_app": {"url": edit_form_url(poll_id)}}])
-    rows.append([{"text": "🚀 Pubblica", "switch_inline_query": f"pub|{poll_id}"}])
+    rows.append([{"text": "✏️ Edit", "web_app": {"url": edit_form_url(poll_id)}}])
+    rows.append([{"text": "🚀 Publish", "switch_inline_query": f"pub|{poll_id}"}])
     return {"inline_keyboard": rows}
 
 
@@ -372,7 +372,7 @@ def delete_poll_completely(poll_id: str, poll: dict):
     """Chiude il sondaggio, aggiorna un'ultima volta tutte le sue copie,
     poi lo rimuove del tutto (log dei voti inclusi, persi volutamente)."""
     poll["closed"] = True
-    final_text = build_text(poll) + "\n\n🗑️ Sondaggio eliminato dall'amministratore."
+    final_text = build_text(poll) + "\n\n🗑️ Poll deleted by the administrator."
     for imid in poll.get("locations", []):
         tg("editMessageText", inline_message_id=imid, text=final_text, parse_mode="HTML")
     redis.delete(f"poll:{poll_id}")
@@ -415,40 +415,40 @@ def resolve_user_id(raw: str):
     raw = raw.strip().lstrip("@")
     if raw.isdigit():
         return raw, None
-    return None, ("La ricerca per username non è supportata dall'API dei bot Telegram "
-                   "(nemmeno se quella persona ha già scritto al bot). "
-                   "Serve l'ID numerico: chiedile di scrivere a @userinfobot per trovarlo.")
+    return None, ("Username search is not supported by the Telegram bot API "
+                   "(even if that person has already messaged the bot). "
+                   "You need the numeric ID: ask them to message @userinfobot to find it.")
 
 
 def cmd_addadmin(chat_id, user_id, args):
     if not is_bot_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del bot.")
+        send_message(chat_id, "This command is reserved for bot administrators.")
         return
     if not args:
-        send_message(chat_id, "Uso: /addadmin ID_UTENTE\n\n"
-                               "L'ID numerico si trova scrivendo a @userinfobot.")
+        send_message(chat_id, "Usage: /addadmin USER_ID\n\n"
+                               "You can find the numeric ID by messaging @userinfobot.")
         return
     new_id, err = resolve_user_id(args[0])
     if err:
         send_message(chat_id, err)
         return
     redis.sadd("bot_admins", new_id)
-    send_message(chat_id, f"✅ Utente {new_id} aggiunto come amministratore del bot.")
+    send_message(chat_id, f"✅ User {new_id} added as a bot administrator.")
 
 
 def cmd_deladmin(chat_id, user_id, args):
     if not is_bot_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del bot.")
+        send_message(chat_id, "This command is reserved for bot administrators.")
         return
     if not args or not args[0].isdigit():
-        send_message(chat_id, "Uso: /deladmin ID_UTENTE")
+        send_message(chat_id, "Usage: /deladmin USER_ID")
         return
     if int(args[0]) in INITIAL_ADMIN_IDS:
-        send_message(chat_id, "Questo utente è admin fisso (variabile d'ambiente BOT_ADMIN_IDS su Vercel): "
-                               "per rimuoverlo modifica quella variabile, non è revocabile da qui.")
+        send_message(chat_id, "This user is a fixed admin (BOT_ADMIN_IDS environment variable on Vercel): "
+                               "to remove them, edit that variable — it cannot be revoked from here.")
         return
     redis.srem("bot_admins", args[0])
-    send_message(chat_id, f"🗑️ Utente {args[0]} rimosso dagli amministratori del bot.")
+    send_message(chat_id, f"🗑️ User {args[0]} removed from bot administrators.")
 
 
 def get_display_name(uid) -> str:
@@ -468,52 +468,52 @@ def get_display_name(uid) -> str:
 
 def cmd_admins(chat_id, user_id):
     if not is_bot_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del bot.")
+        send_message(chat_id, "This command is reserved for bot administrators.")
         return
 
     dynamic_ids = sorted((redis.smembers("bot_admins") or []), key=int)
     if not INITIAL_ADMIN_IDS and not dynamic_ids:
-        send_message(chat_id, "Nessun amministratore configurato.")
+        send_message(chat_id, "No administrators configured.")
         return
 
     for uid in sorted(INITIAL_ADMIN_IDS):
-        text = pad_for_width("🔒 Amministratore fisso") + f"\n{get_display_name(uid)}"
+        text = pad_for_width("🔒 Fixed administrator") + f"\n{get_display_name(uid)}"
         keyboard = {"inline_keyboard": [[
-            {"text": "🔒 Non rimovibile da qui", "callback_data": f"admdel|fixed|{uid}"}
+            {"text": "🔒 Not removable here", "callback_data": f"admdel|fixed|{uid}"}
         ]]}
         send_message(chat_id, text, keyboard)
 
     for uid in dynamic_ids:
-        text = pad_for_width("👤 Amministratore") + f"\n{get_display_name(uid)}"
+        text = pad_for_width("👤 Administrator") + f"\n{get_display_name(uid)}"
         keyboard = {"inline_keyboard": [[
-            {"text": "🗑️ Rimuovi", "callback_data": f"admdel|remove|{uid}"}
+            {"text": "🗑️ Remove", "callback_data": f"admdel|remove|{uid}"}
         ]]}
         send_message(chat_id, text, keyboard)
 
-    send_message(chat_id, pad_for_width("➕ Aggiungi un nuovo amministratore"),
-                 {"inline_keyboard": [[{"text": "➕ Aggiungi amministratore", "callback_data": "admadd"}]]})
+    send_message(chat_id, pad_for_width("➕ Add a new administrator"),
+                 {"inline_keyboard": [[{"text": "➕ Add administrator", "callback_data": "admadd"}]]})
 
 
 def handle_admdel_callback(callback_id, user_id, chat_id, message_id, action, target_uid):
     if not is_bot_admin(user_id):
-        answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
+        answer_callback(callback_id, "Reserved for bot administrators.", alert=True)
         return
     if action == "fixed":
-        answer_callback(callback_id, "Admin fisso da variabile d'ambiente: non rimovibile da qui.", alert=True)
+        answer_callback(callback_id, "Fixed admin from environment variable: not removable here.", alert=True)
         return
     redis.srem("bot_admins", target_uid)
-    edit_message(chat_id, message_id, f"🗑️ Amministratore {target_uid} rimosso.")
-    answer_callback(callback_id, "Rimosso.")
+    edit_message(chat_id, message_id, f"🗑️ Administrator {target_uid} removed.")
+    answer_callback(callback_id, "Removed.")
 
 
 def handle_admadd_callback(callback_id, user_id, chat_id):
     if not is_bot_admin(user_id):
-        answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
+        answer_callback(callback_id, "Reserved for bot administrators.", alert=True)
         return
     redis.set(f"awaiting_newadmin:{user_id}", "1")
-    send_message(chat_id, "Scrivi l'ID Telegram numerico del nuovo amministratore.\n\n"
-                           "Si trova scrivendo a @userinfobot (la ricerca per username non è "
-                           "possibile: è un limite dell'API dei bot Telegram, non aggirabile).")
+    send_message(chat_id, "Send the numeric Telegram ID of the new administrator.\n\n"
+                           "You can find it by messaging @userinfobot (username search is not "
+                           "possible: it's a Telegram bot API limitation, not something we can work around).")
     answer_callback(callback_id)
 
 
@@ -526,7 +526,7 @@ def handle_newadmin_text(chat_id, user_id, text):
         send_message(chat_id, err)
         return True
     redis.sadd("bot_admins", new_id)
-    send_message(chat_id, f"✅ Utente {new_id} aggiunto come amministratore del bot.")
+    send_message(chat_id, f"✅ User {new_id} added as a bot administrator.")
     return True
 
 
@@ -537,31 +537,31 @@ def cmd_start(chat_id, user_id, args, from_user):
         poll_id = args[0][len("addopt_"):]
         poll = get_json(f"poll:{poll_id}")
         if not poll or poll["closed"]:
-            send_message(chat_id, "Questo sondaggio non è più disponibile.")
+            send_message(chat_id, "This poll is no longer available.")
             return
         if not poll.get("allow_suggestions"):
-            send_message(chat_id, "Questo sondaggio non accetta opzioni proposte dagli utenti.")
+            send_message(chat_id, "This poll does not accept options suggested by users.")
             return
         if len(poll["options"]) >= 10:
-            send_message(chat_id, "Questo sondaggio ha già raggiunto il numero massimo di opzioni.")
+            send_message(chat_id, "This poll has already reached the maximum number of options.")
             return
         redis.set(f"awaiting_option:{user_id}", poll_id)
-        send_message(chat_id, f"Scrivi il testo della nuova opzione da proporre per:\n\n"
+        send_message(chat_id, f"Send the text of the new option you want to suggest for:\n\n"
                                f"«{poll['question']}»")
         return
 
     if not is_bot_admin(user_id):
-        send_message(chat_id, "Questo bot è ad uso privato.")
+        send_message(chat_id, "This bot is private.")
         return
 
     name = f"@{from_user['username']}" if from_user.get("username") else from_user.get("first_name", "")
     form_url = request.host_url.rstrip("/") + "/api/pollform"
     keyboard = {"inline_keyboard": [
-        [{"text": "📊 Crea un sondaggio", "web_app": {"url": form_url}}],
-        [{"text": "🗂 Gestisci i sondaggi", "callback_data": "startmenu|polls"}],
-        [{"text": "👥 Gestisci gli amministratori", "callback_data": "startmenu|admins"}],
+        [{"text": "📊 Create a poll", "web_app": {"url": form_url}}],
+        [{"text": "🗂 Manage polls", "callback_data": "startmenu|polls"}],
+        [{"text": "👥 Manage administrators", "callback_data": "startmenu|admins"}],
     ]}
-    send_message(chat_id, pad_first_line(f"Benvenuto {name}, cosa posso fare per te oggi?"), keyboard)
+    send_message(chat_id, pad_first_line(f"Welcome {name}, what can I do for you today?"), keyboard)
 
 
 def handle_option_suggestion(chat_id, user_id, text):
@@ -572,52 +572,52 @@ def handle_option_suggestion(chat_id, user_id, text):
     redis.delete(f"awaiting_option:{user_id}")
     option = text.strip()
     if not option:
-        send_message(chat_id, "Opzione vuota, non è stata aggiunta.")
+        send_message(chat_id, "Empty option, nothing was added.")
         return True
 
     poll = get_json(f"poll:{poll_id}")
     if not poll or poll["closed"] or not poll.get("allow_suggestions"):
-        send_message(chat_id, "Questo sondaggio non è più disponibile per nuove proposte.")
+        send_message(chat_id, "This poll is no longer accepting new suggestions.")
         return True
     if len(poll["options"]) >= 10:
-        send_message(chat_id, "Il sondaggio ha già raggiunto il numero massimo di opzioni.")
+        send_message(chat_id, "The poll has already reached the maximum number of options.")
         return True
     if any(o.strip().lower() == option.lower() for o in poll["options"]):
-        send_message(chat_id, "Questa opzione è già presente nel sondaggio.")
+        send_message(chat_id, "This option is already in the poll.")
         return True
 
     poll["options"].append(option)
     set_json(f"poll:{poll_id}", poll)
     sync_poll(poll)
-    send_message(chat_id, f"✅ Opzione aggiunta al sondaggio: «{option}»")
+    send_message(chat_id, f"✅ Option added to the poll: «{option}»")
     return True
 
 
 def cmd_newpoll(chat_id, user_id):
     if not is_bot_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del bot.")
+        send_message(chat_id, "This command is reserved for bot administrators.")
         return
     remember_admin_chat(user_id, chat_id)
     form_url = request.host_url.rstrip("/") + "/api/pollform"
-    keyboard = {"inline_keyboard": [[{"text": "📊 Crea sondaggio", "web_app": {"url": form_url}}]]}
-    send_message(chat_id, pad_for_width("📊 Nuovo sondaggio"), keyboard)
+    keyboard = {"inline_keyboard": [[{"text": "📊 Create poll", "web_app": {"url": form_url}}]]}
+    send_message(chat_id, pad_for_width("📊 New poll"), keyboard)
 
 
 def build_log_text(poll_id: str) -> str:
     raw = redis.lrange(f"log:{poll_id}", 0, -1) or []
     if not raw:
-        return "Nessun voto registrato per questo sondaggio."
+        return "No votes recorded for this poll yet."
     events = [json.loads(r) for r in raw]
     per_user_events, per_user_name = {}, {}
     for e in events:
         uid = e["user_id"]
         per_user_name[uid] = e["name"]
         per_user_events.setdefault(uid, []).append(e)
-    lines = ["📋 Riepilogo voti", ""]
+    lines = ["📋 Vote summary", ""]
     for uid in sorted(per_user_events, key=lambda u: per_user_name[u].lower()):
         lines.append(f"👤 {per_user_name[uid]}")
         for i, e in enumerate(per_user_events[uid]):
-            label = "Primo voto" if i == 0 else "Cambio voto"
+            label = "First vote" if i == 0 else "Vote changed"
             lines.append(f"{label}: {e['new_choice']}")
         lines.append("")
     return "\n".join(lines).strip()
@@ -644,14 +644,14 @@ def pad_first_line(full_text: str, min_len: int = 50) -> str:
 
 def cmd_polls(chat_id, user_id):
     if not is_bot_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del bot.")
+        send_message(chat_id, "This command is reserved for bot administrators.")
         return
 
     poll_ids = sorted(redis.smembers("polls_index") or [], key=int)
     tpl_ids = sorted(redis.smembers("templates_index") or [], key=int)
 
     if not poll_ids and not tpl_ids:
-        send_message(chat_id, "Nessun sondaggio creato ancora.")
+        send_message(chat_id, "No polls created yet.")
         return
 
     for pid in poll_ids:
@@ -659,22 +659,22 @@ def cmd_polls(chat_id, user_id):
         if not p:
             continue
         if p["closed"]:
-            text = pad_for_width(f"🔒 {p['question']}") + "\n(chiuso)"
+            text = pad_for_width(f"🔒 {p['question']}") + "\n(closed)"
             keyboard = {"inline_keyboard": [[
-                {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{pid}"},
-                {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{pid}"},
+                {"text": "🗑️ Delete", "callback_data": f"mgmt|delete|{pid}"},
+                {"text": "🔓 Reopen", "callback_data": f"mgmt|reopen|{pid}"},
                 {"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"},
             ]]}
         else:
             text = pad_for_width(f"📊 {p['question']}")
             keyboard = {"inline_keyboard": [
                 [
-                    {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(pid)}},
-                    {"text": "↗️ Condividi", "switch_inline_query": f"share|{pid}"},
+                    {"text": "✏️ Edit", "web_app": {"url": edit_form_url(pid)}},
+                    {"text": "↗️ Share", "switch_inline_query": f"share|{pid}"},
                 ],
                 [
                     {"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"},
-                    {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
+                    {"text": "🔒 Close", "callback_data": f"mgmt|close|{pid}"},
                 ],
             ]}
         send_message(chat_id, text, keyboard)
@@ -685,11 +685,11 @@ def cmd_polls(chat_id, user_id):
             continue
         rid = f"R{tid}"
         first_line = pad_for_width(
-            f"📅 Sondaggio scadenziato (ogni {WEEKDAY_NAMES[t['weekday']]})")
+            f"📅 Scheduled poll (every {WEEKDAY_NAMES[t['weekday']]})")
         text = f"{first_line}\n{t['question']}"
         keyboard = {"inline_keyboard": [[
-            {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(rid)}},
-            {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{rid}"},
+            {"text": "✏️ Edit", "web_app": {"url": edit_form_url(rid)}},
+            {"text": "🗑️ Delete", "callback_data": f"mgmt|delete|{rid}"},
         ]]}
         send_message(chat_id, text, keyboard)
 
@@ -700,20 +700,20 @@ def handle_poll_edit(chat_id, user_id, payload):
     poll_id = payload["edit_poll_id"]
     poll = get_json(f"poll:{poll_id}")
     if not poll:
-        send_message(chat_id, "Sondaggio non trovato.")
-        return False, "Sondaggio non trovato."
+        send_message(chat_id, "Poll not found.")
+        return False, "Poll not found."
     if poll["closed"]:
-        send_message(chat_id, "Questo sondaggio è ormai chiuso e non può più essere modificato.")
-        return False, "Questo sondaggio è ormai chiuso."
+        send_message(chat_id, "This poll is now closed and can no longer be edited.")
+        return False, "This poll is now closed."
 
     question = (payload.get("question") or "").strip()
     new_options = [o.strip() for o in payload.get("options", []) if o.strip()]
     if not question:
-        send_message(chat_id, "La domanda non può essere vuota. Modifica annullata.")
-        return False, "La domanda non può essere vuota."
+        send_message(chat_id, "The question cannot be empty. Edit cancelled.")
+        return False, "The question cannot be empty."
     if not (2 <= len(new_options) <= 10):
-        send_message(chat_id, "Servono tra 2 e 10 opzioni. Modifica annullata.")
-        return False, "Servono tra 2 e 10 opzioni."
+        send_message(chat_id, "You need between 2 and 10 options. Edit cancelled.")
+        return False, "You need between 2 and 10 options."
 
     # Rimappa i voti esistenti: le opzioni il cui testo non è cambiato
     # mantengono i voti; le opzioni rimosse o rinominate perdono i loro
@@ -755,33 +755,33 @@ def handle_poll_edit(chat_id, user_id, payload):
     set_json(f"poll:{poll_id}", poll)
     if poll.get("locations"):
         sync_poll(poll)
-        send_message(chat_id, "✅ Sondaggio aggiornato.")
+        send_message(chat_id, "✅ Poll updated.")
     else:
         # È ancora una bozza non pubblicata: si torna alla preview.
         send_message(chat_id, pad_first_line(build_text(poll)), build_preview_keyboard(poll), parse_mode="HTML")
-    return True, "Sondaggio aggiornato."
+    return True, "Poll updated."
 
 
 def handle_template_edit(chat_id, user_id, payload):
     tpl_id = payload["edit_poll_id"][1:]  # toglie il prefisso "R"
     tpl = get_json(f"template:{tpl_id}")
     if not tpl:
-        send_message(chat_id, "Sondaggio ricorrente non trovato.")
-        return False, "Sondaggio ricorrente non trovato."
+        send_message(chat_id, "Recurring poll not found.")
+        return False, "Recurring poll not found."
 
     question = (payload.get("question") or "").strip()
     new_options = [o.strip() for o in payload.get("options", []) if o.strip()]
     if not question:
-        send_message(chat_id, "La domanda non può essere vuota. Modifica annullata.")
-        return False, "La domanda non può essere vuota."
+        send_message(chat_id, "The question cannot be empty. Edit cancelled.")
+        return False, "The question cannot be empty."
     if not (2 <= len(new_options) <= 10):
-        send_message(chat_id, "Servono tra 2 e 10 opzioni. Modifica annullata.")
-        return False, "Servono tra 2 e 10 opzioni."
+        send_message(chat_id, "You need between 2 and 10 options. Edit cancelled.")
+        return False, "You need between 2 and 10 options."
 
     weekday = payload.get("weekday")
     if weekday is None or not (0 <= int(weekday) <= 6):
-        send_message(chat_id, "Giorno della settimana non valido. Modifica annullata.")
-        return False, "Giorno della settimana non valido."
+        send_message(chat_id, "Invalid day of the week. Edit cancelled.")
+        return False, "Invalid day of the week."
     weekday = int(weekday)
 
     old_weekday = tpl["weekday"]
@@ -801,14 +801,14 @@ def handle_template_edit(chat_id, user_id, payload):
         redis.srem(f"templates_by_day:{old_weekday}", tpl_id)
         redis.sadd(f"templates_by_day:{weekday}", tpl_id)
 
-    send_message(chat_id, f"✅ Sondaggio ricorrente aggiornato (ogni {WEEKDAY_NAMES[weekday]}).")
-    return True, "Sondaggio ricorrente aggiornato."
+    send_message(chat_id, f"✅ Recurring poll updated (every {WEEKDAY_NAMES[weekday]}).")
+    return True, "Recurring poll updated."
 
 
 
 def handle_web_app_data(chat_id, user_id, payload):
     if not is_bot_admin(user_id):
-        return False, "Comando riservato agli amministratori del bot."
+        return False, "This command is reserved for bot administrators."
 
     edit_id = payload.get("edit_poll_id")
     if edit_id:
@@ -820,9 +820,9 @@ def handle_web_app_data(chat_id, user_id, payload):
     options = [o.strip() for o in payload.get("options", []) if o.strip()]
 
     if not question:
-        return False, "La domanda non può essere vuota."
+        return False, "The question cannot be empty."
     if not (2 <= len(options) <= 10):
-        return False, "Servono tra 2 e 10 opzioni."
+        return False, "You need between 2 and 10 options."
 
     fields = {
         "question": question,
@@ -839,27 +839,27 @@ def handle_web_app_data(chat_id, user_id, payload):
     if payload.get("recurrent"):
         weekday = payload.get("weekday")
         if weekday is None or not (0 <= int(weekday) <= 6):
-            return False, "Giorno della settimana non valido."
+            return False, "Invalid day of the week."
         tpl_id = save_template(fields, int(weekday), chat_id)
-        send_message(chat_id, f"✅ Sondaggio ricorrente salvato (#R{tpl_id}).\n"
-                               f"Ogni {WEEKDAY_NAMES[int(weekday)]} mattina (circa le 9) riceverai un promemoria "
-                               f"con un bottone per rivederlo e scegliere dove pubblicarlo.")
-        return True, "Sondaggio ricorrente salvato."
+        send_message(chat_id, f"✅ Recurring poll saved (#R{tpl_id}).\n"
+                               f"Every {WEEKDAY_NAMES[int(weekday)]} morning (around 9 AM) you'll get a reminder "
+                               f"with a button to review it and choose where to publish it.")
+        return True, "Recurring poll saved."
     else:
         poll = create_draft(fields, chat_id)
         send_message(chat_id, pad_first_line(build_text(poll)), build_preview_keyboard(poll), parse_mode="HTML")
-        return True, "Bozza pronta: rivedila e pubblicala."
+        return True, "Draft ready: review it and publish it."
 
 
 # ================= CALLBACK: VOTO E RICORRENTI =================
 
 def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
     if not is_bot_admin(user_id):
-        answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
+        answer_callback(callback_id, "Reserved for bot administrators.", alert=True)
         return
     tpl = get_json(f"template:{tpl_id}")
     if not tpl:
-        answer_callback(callback_id, "Modello non più disponibile.", alert=True)
+        answer_callback(callback_id, "Template no longer available.", alert=True)
         return
     poll = create_draft(extract_fields(tpl), chat_id)
     edit_message(chat_id, message_id, pad_first_line(build_text(poll)), build_preview_keyboard(poll), parse_mode="HTML")
@@ -868,7 +868,7 @@ def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
 
 def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item_id):
     if not is_bot_admin(user_id):
-        answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
+        answer_callback(callback_id, "Reserved for bot administrators.", alert=True)
         return
 
     kind, raw = parse_item_id(item_id)
@@ -876,19 +876,19 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
     if kind == "template":
         tpl = get_json(f"template:{raw}")
         if not tpl:
-            answer_callback(callback_id, "Modello non trovato.", alert=True)
+            answer_callback(callback_id, "Template not found.", alert=True)
             return
         if action == "delete":
             delete_template_completely(raw, tpl)
-            edit_message(chat_id, message_id, "🗑️ Sondaggio ricorrente eliminato.")
-            answer_callback(callback_id, "Eliminato.")
+            edit_message(chat_id, message_id, "🗑️ Recurring poll deleted.")
+            answer_callback(callback_id, "Deleted.")
         else:
-            answer_callback(callback_id, "Azione non disponibile per un sondaggio ricorrente.", alert=True)
+            answer_callback(callback_id, "This action is not available for a recurring poll.", alert=True)
         return
 
     poll = get_json(f"poll:{raw}")
     if not poll:
-        answer_callback(callback_id, "Sondaggio non trovato.", alert=True)
+        answer_callback(callback_id, "Poll not found.", alert=True)
         return
 
     if action == "log":
@@ -897,40 +897,40 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
 
     elif action == "close":
         close_poll_only(raw, poll)
-        text = pad_for_width(f"🔒 {poll['question']}") + "\n(chiuso)"
+        text = pad_for_width(f"🔒 {poll['question']}") + "\n(closed)"
         edit_message(chat_id, message_id, text, {"inline_keyboard": [[
-            {"text": "🗑️ Elimina", "callback_data": f"mgmt|delete|{raw}"},
-            {"text": "🔓 Riapri", "callback_data": f"mgmt|reopen|{raw}"},
+            {"text": "🗑️ Delete", "callback_data": f"mgmt|delete|{raw}"},
+            {"text": "🔓 Reopen", "callback_data": f"mgmt|reopen|{raw}"},
             {"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"},
         ]]})
-        answer_callback(callback_id, "Sondaggio chiuso.")
+        answer_callback(callback_id, "Poll closed.")
 
     elif action == "reopen":
         reopen_poll(raw, poll)
         text = pad_for_width(f"📊 {poll['question']}")
         rows = [
             [
-                {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(raw)}},
-                {"text": "↗️ Condividi", "switch_inline_query": f"share|{raw}"},
+                {"text": "✏️ Edit", "web_app": {"url": edit_form_url(raw)}},
+                {"text": "↗️ Share", "switch_inline_query": f"share|{raw}"},
             ],
             [
                 {"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"},
-                {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
+                {"text": "🔒 Close", "callback_data": f"mgmt|close|{raw}"},
             ],
         ]
         edit_message(chat_id, message_id, text, {"inline_keyboard": rows})
-        answer_callback(callback_id, "Sondaggio riaperto.")
+        answer_callback(callback_id, "Poll reopened.")
 
     elif action == "delete":
         delete_poll_completely(raw, poll)
-        edit_message(chat_id, message_id, "🗑️ Sondaggio eliminato.")
-        answer_callback(callback_id, "Eliminato.")
+        edit_message(chat_id, message_id, "🗑️ Poll deleted.")
+        answer_callback(callback_id, "Deleted.")
 
 
 def handle_vote_callback(callback_id, user, poll_id, idx):
     poll = get_json(f"poll:{poll_id}")
     if not poll or poll["closed"]:
-        answer_callback(callback_id, "Sondaggio non più attivo.")
+        answer_callback(callback_id, "This poll is no longer active.")
         return
 
     uid = str(user["id"])
@@ -939,7 +939,7 @@ def handle_vote_callback(callback_id, user, poll_id, idx):
     had_voted_before = bool(entry["choices"])
 
     if not poll["allow_revote"] and had_voted_before:
-        answer_callback(callback_id, "Il voto è definitivo per questo sondaggio.")
+        answer_callback(callback_id, "The vote is final for this poll.")
         return
 
     old_names = [poll["options"][i] for i in entry["choices"]]
@@ -957,11 +957,11 @@ def handle_vote_callback(callback_id, user, poll_id, idx):
     set_json(f"poll:{poll_id}", poll)
 
     new_names = [poll["options"][i] for i in entry["choices"]]
-    log_event(poll_id, user, "cambio_voto" if had_voted_before else "voto",
+    log_event(poll_id, user, "vote_changed" if had_voted_before else "vote",
               ", ".join(old_names), ", ".join(new_names) or "(nessuna)")
 
     sync_poll(poll)
-    answer_callback(callback_id, f"Voto registrato: {', '.join(new_names) or 'nessuna scelta'}")
+    answer_callback(callback_id, f"Vote recorded: {', '.join(new_names) or 'no selection'}")
 
 
 # ================= ENTRY POINT WEBHOOK =================
@@ -992,8 +992,8 @@ def handle_inline_query(iq: dict):
         result = {
             "type": "article",
             "id": f"pub|{item_id}",
-            "title": plain_preview(poll["question"]) or "Sondaggio",
-            "description": "Pubblica il sondaggio in questa chat",
+            "title": plain_preview(poll["question"]) or "Poll",
+            "description": "Publish the poll in this chat",
             "input_message_content": {"message_text": build_text(poll), "parse_mode": "HTML"},
             "reply_markup": build_keyboard(poll),
         }
@@ -1008,8 +1008,8 @@ def handle_inline_query(iq: dict):
         result = {
             "type": "article",
             "id": f"share|{item_id}",
-            "title": plain_preview(poll["question"]) or "Sondaggio",
-            "description": "Tocca per condividere questo sondaggio qui: resta sincronizzato",
+            "title": plain_preview(poll["question"]) or "Poll",
+            "description": "Tap to share this poll here: it stays in sync",
             "input_message_content": {"message_text": build_text(poll), "parse_mode": "HTML"},
             "reply_markup": build_keyboard(poll),
         }
@@ -1044,7 +1044,7 @@ def handle_chosen_inline_result(cir: dict):
             redis.sadd("polls_index", item_id)
         creator_chat_id = poll.get("creator_chat_id")
         if creator_chat_id:
-            send_message(creator_chat_id, "✅ Sondaggio pubblicato!")
+            send_message(creator_chat_id, "✅ Poll published!")
 
     elif mode == "share":
         locations = poll.get("locations", [])
@@ -1066,9 +1066,9 @@ def ensure_commands_registered():
     if redis.get("commands_registered_v6"):
         return
     tg("setMyCommands", commands=[
-        {"command": "newpoll", "description": "📊 Crea un sondaggio"},
-        {"command": "polls", "description": "🗂 Gestisci i sondaggi"},
-        {"command": "admins", "description": "👥 Gestisci gli amministratori"},
+        {"command": "newpoll", "description": "📊 Create a poll"},
+        {"command": "polls", "description": "🗂 Manage polls"},
+        {"command": "admins", "description": "👥 Manage administrators"},
     ])
     launcher_url = request.host_url.rstrip("/") + "/api/launcher"
     tg("setChatMenuButton", menu_button={
@@ -1138,7 +1138,7 @@ def webhook():
         elif data.startswith("startmenu|") and msg_ref:
             action = data.split("|", 1)[1]
             if not is_bot_admin(user["id"]):
-                answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
+                answer_callback(callback_id, "Reserved for bot administrators.", alert=True)
             else:
                 if action == "polls":
                     cmd_polls(msg_ref["chat"]["id"], user["id"])
@@ -1149,24 +1149,24 @@ def webhook():
             _, poll_id, idx = data.split("|")
             handle_vote_callback(callback_id, user, poll_id, int(idx))
         elif data.startswith("previewnoop|"):
-            answer_callback(callback_id, "Solo un'anteprima: premi \"🚀 Pubblica\" per rendere il sondaggio votabile.")
+            answer_callback(callback_id, "This is just a preview: tap \"🚀 Publish\" to make the poll votable.")
 
     return {"ok": True}
 
 
 @app.route("/api/webhook", methods=["GET"])
 def health():
-    return {"status": "il bot è online"}
+    return {"status": "the bot is online"}
 
 
 # ================= WEB APP (interfaccia di creazione) =================
 
 POLLFORM_HTML = """<!DOCTYPE html>
-<html lang="it">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>Nuovo sondaggio</title>
+<title>New poll</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root {
@@ -1236,67 +1236,67 @@ POLLFORM_HTML = """<!DOCTYPE html>
 <body>
 
 <div class="topbar">
-  <h1>Nuovo sondaggio</h1>
-  <button class="create-btn" id="createBtn" disabled>Crea</button>
+  <h1>New poll</h1>
+  <button class="create-btn" id="createBtn" disabled>Create</button>
 </div>
 
 <div class="card">
   <div class="row">
-    <textarea id="question" placeholder="Fai una domanda" rows="2"></textarea>
+    <textarea id="question" placeholder="Ask a question" rows="2"></textarea>
   </div>
-  <div class="link-btn" id="linkToggle">🔗 Inserisci link (sito, Google Maps...)</div>
+  <div class="link-btn" id="linkToggle">🔗 Insert link (website, Google Maps...)</div>
   <div class="link-panel" id="linkPanel">
-    <input type="text" id="linkLabel" placeholder="Testo del link (es. Apri su Maps)">
+    <input type="text" id="linkLabel" placeholder="Link text (e.g. Open in Maps)">
     <input type="text" id="linkUrl" placeholder="https://...">
-    <button id="linkInsert">Inserisci nella domanda</button>
+    <button id="linkInsert">Insert into question</button>
   </div>
 </div>
 
-<div class="section-label">Opzioni</div>
+<div class="section-label">Options</div>
 <div class="card" id="optionsCard"></div>
 <div class="hint" id="optHint"></div>
 
-<div class="section-label">Impostazioni</div>
+<div class="section-label">Settings</div>
 <div class="card">
   <div class="setting-row">
-    <div class="setting-text"><b>Mostra chi ha votato</b><span>Il nome dei votanti è visibile a tutti</span></div>
+    <div class="setting-text"><b>Show who voted</b><span>Voter names are visible to everyone</span></div>
     <label class="switch"><input type="checkbox" id="showVoters" checked><span class="slider"></span></label>
   </div>
   <div class="setting-row">
-    <div class="setting-text"><b>Consenti risposte multiple</b><span>I votanti possono scegliere più opzioni</span></div>
+    <div class="setting-text"><b>Allow multiple answers</b><span>Voters can choose more than one option</span></div>
     <label class="switch"><input type="checkbox" id="multiple"><span class="slider"></span></label>
   </div>
   <div class="setting-row">
-    <div class="setting-text"><b>Consenti di cambiare voto</b><span>I votanti possono cambiare la scelta</span></div>
+    <div class="setting-text"><b>Allow vote changes</b><span>Voters can change their choice</span></div>
     <label class="switch"><input type="checkbox" id="allowRevote" checked><span class="slider"></span></label>
   </div>
   <div class="setting-row">
-    <div class="setting-text"><b>Modalità quiz</b><span>Segna una risposta corretta tra le opzioni</span></div>
+    <div class="setting-text"><b>Quiz mode</b><span>Mark one option as the correct answer</span></div>
     <label class="switch"><input type="checkbox" id="quiz"><span class="slider"></span></label>
   </div>
   <div class="setting-row">
-    <div class="setting-text"><b>Consenti di inserire opzioni</b><span>Gli utenti possono proporre nuove opzioni scrivendo al bot</span></div>
+    <div class="setting-text"><b>Allow suggested options</b><span>Users can suggest new options by messaging the bot</span></div>
     <label class="switch"><input type="checkbox" id="allowSuggestions"><span class="slider"></span></label>
   </div>
   <div class="row" id="explanationRow" style="display:none">
-    <textarea id="explanation" placeholder="Spiegazione mostrata a chiusura (opzionale)" rows="2"></textarea>
+    <textarea id="explanation" placeholder="Explanation shown when closed (optional)" rows="2"></textarea>
   </div>
 </div>
 
 <div class="card" id="recurrentCard">
   <div class="setting-row" id="recurrentToggleRow">
-    <div class="setting-text"><b>Sondaggio ricorrente</b><span>Ricevi un promemoria settimanale per ripubblicarlo</span></div>
+    <div class="setting-text"><b>Recurring poll</b><span>Get a weekly reminder to republish it</span></div>
     <label class="switch"><input type="checkbox" id="recurrent"><span class="slider"></span></label>
   </div>
   <div class="row" id="weekdayRow" style="display:none">
     <select id="weekday">
-      <option value="0">Ogni Lunedì</option>
-      <option value="1">Ogni Martedì</option>
-      <option value="2">Ogni Mercoledì</option>
-      <option value="3">Ogni Giovedì</option>
-      <option value="4">Ogni Venerdì</option>
-      <option value="5">Ogni Sabato</option>
-      <option value="6">Ogni Domenica</option>
+      <option value="0">Every Monday</option>
+      <option value="1">Every Tuesday</option>
+      <option value="2">Every Wednesday</option>
+      <option value="3">Every Thursday</option>
+      <option value="4">Every Friday</option>
+      <option value="5">Every Saturday</option>
+      <option value="6">Every Sunday</option>
     </select>
   </div>
 </div>
@@ -1329,7 +1329,7 @@ function addOption(value) {
   row.className = 'opt-row';
   row.innerHTML = `
     <input type="radio" name="correctOpt" class="opt-correct" style="display:none">
-    <input type="text" class="opt-input" placeholder="Opzione" value="${value ? value.replace(/"/g, '&quot;') : ''}">
+    <input type="text" class="opt-input" placeholder="Option" value="${value ? value.replace(/"/g, '&quot;') : ''}">
     <span class="opt-remove">✕</span>`;
   row.querySelector('.opt-remove').onclick = () => { row.remove(); optCount--; refresh(); };
   row.querySelector('.opt-input').addEventListener('input', refresh);
@@ -1340,7 +1340,7 @@ function addOption(value) {
 document.getElementById('optionsCard').insertAdjacentHTML('afterend', '');
 const addRow = document.createElement('div');
 addRow.className = 'add-opt';
-addRow.innerHTML = '➕ Aggiungi un\\'opzione...';
+addRow.innerHTML = '➕ Add an option...';
 addRow.onclick = () => addOption('');
 
 function mountAddRow() {
@@ -1356,7 +1356,7 @@ const editId = urlParams.get('edit');
 const isTemplateEdit = !!(editId && editId.startsWith('R'));
 
 if (editId) {
-  document.getElementById('createBtn').textContent = 'Salva';
+  document.getElementById('createBtn').textContent = 'Save';
 
   // rimuove le due righe opzione vuote create di default, verranno ripopolate
   optionsCard.innerHTML = '';
@@ -1366,19 +1366,19 @@ if (editId) {
     .then(r => r.json())
     .then(data => {
       if (!data.ok) {
-        alert('Sondaggio non trovato o non più modificabile.');
+        alert('Poll not found or no longer editable.');
         tg.close();
         return;
       }
       const p = data.poll;
 
       if (data.is_template) {
-        document.querySelector('.topbar h1').textContent = 'Modifica sondaggio ricorrente';
+        document.querySelector('.topbar h1').textContent = 'Edit recurring poll';
         document.getElementById('recurrentToggleRow').style.display = 'none';
         document.getElementById('weekdayRow').style.display = 'flex';
         document.getElementById('weekday').value = String(p.weekday);
       } else {
-        document.querySelector('.topbar h1').textContent = 'Modifica sondaggio';
+        document.querySelector('.topbar h1').textContent = 'Edit poll';
         document.getElementById('recurrentCard').style.display = 'none';
       }
 
@@ -1400,14 +1400,14 @@ if (editId) {
       validate();
     })
     .catch(() => {
-      alert('Errore nel caricamento del sondaggio da modificare.');
+      alert('Error loading the poll to edit.');
       tg.close();
     });
 }
 
 function refresh() {
   const remaining = MAX_OPT - optCount;
-  optHint.textContent = remaining > 0 ? `Puoi aggiungere altre ${remaining} opzioni.` : 'Hai raggiunto il massimo di opzioni.';
+  optHint.textContent = remaining > 0 ? `You can add ${remaining} more options.` : 'You have reached the maximum number of options.';
   addRow.style.display = optCount >= MAX_OPT ? 'none' : 'flex';
   validate();
 }
@@ -1505,12 +1505,12 @@ document.getElementById('createBtn').addEventListener('click', () => {
       if (res.ok) {
         tg.close();
       } else {
-        alert(res.message || 'Si è verificato un errore, riprova.');
+        alert(res.message || 'Something went wrong, please try again.');
         btn.disabled = false;
       }
     })
     .catch(() => {
-      alert('Errore di connessione, riprova.');
+      alert('Connection error, please try again.');
       btn.disabled = false;
     });
 });
@@ -1530,10 +1530,10 @@ def submitpoll():
 
     user = validate_init_data(init_data)
     if not user:
-        return {"ok": False, "message": "Sessione non valida, riapri la schermata da Telegram."}, 401
+        return {"ok": False, "message": "Invalid session, reopen the screen from Telegram."}, 401
 
     user_id = user.get("id")
-    chat_id = user_id  # in chat privata, il chat_id coincide con lo user_id
+    chat_id = user_id  # in a private chat, chat_id equals user_id
     ok, message = handle_web_app_data(chat_id, user_id, payload)
     return {"ok": ok, "message": message}
 
@@ -1549,12 +1549,12 @@ def launcheraction():
 
     user = validate_init_data(init_data)
     if not user:
-        return {"ok": False, "message": "Sessione non valida, riapri la schermata da Telegram."}, 401
+        return {"ok": False, "message": "Invalid session, reopen the screen from Telegram."}, 401
 
     user_id = user.get("id")
     chat_id = user_id
     if not is_bot_admin(user_id):
-        return {"ok": False, "message": "Riservato agli amministratori del bot."}, 403
+        return {"ok": False, "message": "Reserved for bot administrators."}, 403
 
     if action == "polls":
         cmd_polls(chat_id, user_id)
@@ -1573,7 +1573,7 @@ def pollform():
 
 
 LAUNCHER_HTML = """<!DOCTYPE html>
-<html lang="it">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
@@ -1603,11 +1603,11 @@ LAUNCHER_HTML = """<!DOCTYPE html>
 </head>
 <body>
 
-<h1>Cosa vuoi fare?</h1>
+<h1>What would you like to do?</h1>
 <div class="card">
-  <div class="item" id="btnNew"><span class="emoji">📊</span><span class="label">Crea un sondaggio</span></div>
-  <div class="item" id="btnPolls"><span class="emoji">🗂</span><span class="label">Gestisci i sondaggi</span></div>
-  <div class="item" id="btnAdmins"><span class="emoji">👥</span><span class="label">Gestisci gli amministratori</span></div>
+  <div class="item" id="btnNew"><span class="emoji">📊</span><span class="label">Create a poll</span></div>
+  <div class="item" id="btnPolls"><span class="emoji">🗂</span><span class="label">Manage polls</span></div>
+  <div class="item" id="btnAdmins"><span class="emoji">👥</span><span class="label">Manage administrators</span></div>
 </div>
 
 <script>
@@ -1640,10 +1640,10 @@ function runAction(action) {
       if (res.ok) {
         tg.close();
       } else {
-        alert(res.message || 'Si è verificato un errore, riprova.');
+        alert(res.message || 'Something went wrong, please try again.');
       }
     })
-    .catch(() => alert('Errore di connessione, riprova.'));
+    .catch(() => alert('Connection error, please try again.'));
 }
 
 document.getElementById('btnPolls').addEventListener('click', () => runAction('polls'));
@@ -1742,10 +1742,10 @@ def cron():
             if redis.get(dedup_key):
                 continue
             keyboard = {"inline_keyboard": [[
-                {"text": "✅ Crea sondaggio ora", "callback_data": f"recur|{tid}"}
+                {"text": "✅ Create poll now", "callback_data": f"recur|{tid}"}
             ]]}
             text = pad_first_line(
-                f"📅 Promemoria: è il momento di pubblicare il sondaggio ricorrente #R{tid}:\n\n{tpl['question']}")
+                f"📅 Reminder: it's time to publish the recurring poll #R{tid}:\n\n{tpl['question']}")
             for entry in admin_chats:
                 uid_str, chat_id_str = entry.split(":")
                 if is_bot_admin(int(uid_str)):
