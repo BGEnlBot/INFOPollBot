@@ -29,14 +29,16 @@ ARCHITETTURA:
     Vercel Cron Job che chiama /api/cron una volta al giorno
 
 VARIABILI D'AMBIENTE (Vercel -> Project Settings -> Environment Variables):
-    TELEGRAM_TOKEN              token del bot, da @BotFather
-    CHANNEL_ID                  canale i cui admin possono usare il bot
-                                 (es. "@nomecanale" o -100...) — serve solo
-                                 per stabilire CHI può usare il bot, non è
-                                 più la destinazione automatica dei sondaggi
-    UPSTASH_REDIS_REST_URL      da dashboard Upstash
-    UPSTASH_REDIS_REST_TOKEN    da dashboard Upstash
-    CRON_SECRET                 generato automaticamente da Vercel
+    TELEGRAM_TOKEN               token del bot, da @BotFather
+    BOT_ADMIN_IDS                ID Telegram numerici degli amministratori
+                                  del bot, separati da virgola (es. "111,222").
+                                  Per scoprire il proprio ID, scrivi a
+                                  @userinfobot. Altri admin possono essere
+                                  aggiunti dopo con /addadmin, senza
+                                  toccare questa variabile.
+    UPSTASH_REDIS_REST_URL       da dashboard Upstash
+    UPSTASH_REDIS_REST_TOKEN     da dashboard Upstash
+    CRON_SECRET                  generato automaticamente da Vercel
 
 DOPO IL DEPLOY, imposta il webhook (una volta sola):
     https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<tuo-progetto>.vercel.app/api/webhook
@@ -66,9 +68,14 @@ from flask import Flask, request
 from upstash_redis import Redis
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
+
+# ID Telegram (numerici) degli amministratori "fissi" del bot, separati da
+# virgola. Sono sempre admin, non revocabili da comando (solo cambiando
+# questa variabile d'ambiente su Vercel). Altri admin possono essere
+# aggiunti/rimossi dinamicamente con /addadmin e /deladmin.
+INITIAL_ADMIN_IDS = {int(x) for x in os.environ.get("BOT_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 WEEKDAY_NAMES = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
 LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
@@ -159,11 +166,10 @@ def get_bot_username() -> str:
     return username
 
 
-def is_channel_admin(user_id: int) -> bool:
-    res = tg("getChatAdministrators", chat_id=CHANNEL_ID)
-    if not res.get("ok"):
-        return False
-    return any(a["user"]["id"] == user_id for a in res["result"])
+def is_bot_admin(user_id: int) -> bool:
+    if user_id in INITIAL_ADMIN_IDS:
+        return True
+    return str(user_id) in (redis.smembers("bot_admins") or [])
 
 
 def validate_init_data(init_data: str, max_age_seconds: int = 86400):
@@ -238,7 +244,7 @@ def log_event(poll_id, user, event_type, old_choice, new_choice):
 
 
 def remember_admin_chat(user_id: int, chat_id: int):
-    if is_channel_admin(user_id):
+    if is_bot_admin(user_id):
         redis.sadd("admin_chats", f"{user_id}:{chat_id}")
 
 
@@ -281,14 +287,6 @@ def build_keyboard(poll: dict):
         username = get_bot_username()
         if username:
             rows.append([{"text": "➕ Proponi un'opzione", "url": f"https://t.me/{username}?start=addopt_{poll['id']}"}])
-    if poll.get("allow_external_share"):
-        username = get_bot_username()
-        if username:
-            # Telegram NON permette bottoni "switch_inline_query" nei post
-            # di un canale: si passa quindi da un bottone url che apre la
-            # chat privata col bot, dove il vero bottone di condivisione
-            # (permesso solo lì) viene mostrato subito dopo.
-            rows.append([{"text": "↗️ Condividi e vota altrove", "url": f"https://t.me/{username}?start=share_{poll['id']}"}])
     return {"inline_keyboard": rows}
 
 
@@ -402,7 +400,72 @@ def edit_form_url(id_str: str) -> str:
 
 # ================= COMANDI (chat privata) =================
 
-def cmd_start(chat_id, user_id, args):
+def cmd_addadmin(chat_id, user_id, args):
+    if not is_bot_admin(user_id):
+        send_message(chat_id, "Comando riservato agli amministratori del bot.")
+        return
+    if not args or not args[0].isdigit():
+        send_message(chat_id, "Uso: /addadmin ID_UTENTE\n\n"
+                               "L'utente deve conoscere il proprio ID Telegram numerico "
+                               "(può scoprirlo scrivendo a @userinfobot).")
+        return
+    redis.sadd("bot_admins", args[0])
+    send_message(chat_id, f"✅ Utente {args[0]} aggiunto come amministratore del bot.")
+
+
+def cmd_deladmin(chat_id, user_id, args):
+    if not is_bot_admin(user_id):
+        send_message(chat_id, "Comando riservato agli amministratori del bot.")
+        return
+    if not args or not args[0].isdigit():
+        send_message(chat_id, "Uso: /deladmin ID_UTENTE")
+        return
+    if int(args[0]) in INITIAL_ADMIN_IDS:
+        send_message(chat_id, "Questo utente è admin fisso (variabile d'ambiente BOT_ADMIN_IDS su Vercel): "
+                               "per rimuoverlo modifica quella variabile, non è revocabile da qui.")
+        return
+    redis.srem("bot_admins", args[0])
+    send_message(chat_id, f"🗑️ Utente {args[0]} rimosso dagli amministratori del bot.")
+
+
+def cmd_admins(chat_id, user_id):
+    if not is_bot_admin(user_id):
+        send_message(chat_id, "Comando riservato agli amministratori del bot.")
+        return
+
+    dynamic_ids = sorted((redis.smembers("bot_admins") or []), key=int)
+    if not INITIAL_ADMIN_IDS and not dynamic_ids:
+        send_message(chat_id, "Nessun amministratore configurato.")
+        return
+
+    for uid in sorted(INITIAL_ADMIN_IDS):
+        text = pad_for_width("🔒 Amministratore fisso") + f"\nID: {uid}"
+        keyboard = {"inline_keyboard": [[
+            {"text": "🔒 Non rimovibile da qui", "callback_data": f"admdel|fixed|{uid}"}
+        ]]}
+        send_message(chat_id, text, keyboard)
+
+    for uid in dynamic_ids:
+        text = pad_for_width("👤 Amministratore") + f"\nID: {uid}"
+        keyboard = {"inline_keyboard": [[
+            {"text": "🗑️ Rimuovi", "callback_data": f"admdel|remove|{uid}"}
+        ]]}
+        send_message(chat_id, text, keyboard)
+
+
+def handle_admdel_callback(callback_id, user_id, chat_id, message_id, action, target_uid):
+    if not is_bot_admin(user_id):
+        answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
+        return
+    if action == "fixed":
+        answer_callback(callback_id, "Admin fisso da variabile d'ambiente: non rimovibile da qui.", alert=True)
+        return
+    redis.srem("bot_admins", target_uid)
+    edit_message(chat_id, message_id, f"🗑️ Amministratore {target_uid} rimosso.")
+    answer_callback(callback_id, "Rimosso.")
+
+
+def cmd_start(chat_id, user_id, args, from_user):
     remember_admin_chat(user_id, chat_id)
 
     if args and args[0].startswith("addopt_"):
@@ -422,22 +485,15 @@ def cmd_start(chat_id, user_id, args):
                                f"«{poll['question']}»")
         return
 
-    if args and args[0].startswith("share_"):
-        poll_id = args[0][len("share_"):]
-        poll = get_json(f"poll:{poll_id}")
-        if not poll or poll["closed"] or not poll.get("allow_external_share"):
-            send_message(chat_id, "Questo sondaggio non è più disponibile per la condivisione.")
-            return
-        keyboard = {"inline_keyboard": [[
-            {"text": "↗️ Scegli dove condividerlo", "switch_inline_query": f"share|{poll_id}"}
-        ]]}
-        send_message(chat_id, f"Tocca il bottone per scegliere in quale chat condividere:\n\n"
-                               f"«{poll['question']}»", keyboard)
+    if not is_bot_admin(user_id):
+        send_message(chat_id, "Questo bot è ad uso privato.")
         return
 
-    send_message(chat_id, "Ciao! Se sei amministratore del canale puoi usare:\n"
+    name = f"@{from_user['username']}" if from_user.get("username") else from_user.get("first_name", "")
+    send_message(chat_id, f"Benvenuto {name}, cosa posso fare per te oggi?\n\n"
                            "/newpoll - crea un sondaggio\n"
-                           "/polls - gestisci sondaggi e ricorrenti (modifica, chiudi, riapri, elimina, log)",
+                           "/polls - gestisci sondaggi e ricorrenti (modifica, chiudi, riapri, elimina, log, condividi)\n"
+                           "/admins - elenco amministratori del bot",
                  reply_markup={"remove_keyboard": True})
 
 
@@ -471,8 +527,8 @@ def handle_option_suggestion(chat_id, user_id, text):
 
 
 def cmd_newpoll(chat_id, user_id):
-    if not is_channel_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del canale.")
+    if not is_bot_admin(user_id):
+        send_message(chat_id, "Comando riservato agli amministratori del bot.")
         return
     remember_admin_chat(user_id, chat_id)
     form_url = request.host_url.rstrip("/") + "/api/pollform"
@@ -508,8 +564,8 @@ def pad_for_width(line: str, min_len: int = 42) -> str:
 
 
 def cmd_polls(chat_id, user_id):
-    if not is_channel_admin(user_id):
-        send_message(chat_id, "Comando riservato agli amministratori del canale.")
+    if not is_bot_admin(user_id):
+        send_message(chat_id, "Comando riservato agli amministratori del bot.")
         return
 
     poll_ids = sorted(redis.smembers("polls_index") or [], key=int)
@@ -532,11 +588,16 @@ def cmd_polls(chat_id, user_id):
             ]]}
         else:
             text = pad_for_width(f"📊 {p['question']}")
-            keyboard = {"inline_keyboard": [[
+            keyboard_rows = [[
                 {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(pid)}},
                 {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{pid}"},
                 {"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"},
-            ]]}
+            ]]
+            if p.get("allow_external_share"):
+                keyboard_rows.append([
+                    {"text": "↗️ Condividi in un'altra chat", "switch_inline_query": f"share|{pid}"}
+                ])
+            keyboard = {"inline_keyboard": keyboard_rows}
         send_message(chat_id, text, keyboard)
 
     for tid in tpl_ids:
@@ -669,8 +730,8 @@ def handle_template_edit(chat_id, user_id, payload):
 
 
 def handle_web_app_data(chat_id, user_id, payload):
-    if not is_channel_admin(user_id):
-        return False, "Comando riservato agli amministratori del canale."
+    if not is_bot_admin(user_id):
+        return False, "Comando riservato agli amministratori del bot."
 
     edit_id = payload.get("edit_poll_id")
     if edit_id:
@@ -717,8 +778,8 @@ def handle_web_app_data(chat_id, user_id, payload):
 # ================= CALLBACK: VOTO E RICORRENTI =================
 
 def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
-    if not is_channel_admin(user_id):
-        answer_callback(callback_id, "Riservato agli amministratori del canale.", alert=True)
+    if not is_bot_admin(user_id):
+        answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
         return
     tpl = get_json(f"template:{tpl_id}")
     if not tpl:
@@ -730,8 +791,8 @@ def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
 
 
 def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item_id):
-    if not is_channel_admin(user_id):
-        answer_callback(callback_id, "Riservato agli amministratori del canale.", alert=True)
+    if not is_bot_admin(user_id):
+        answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
         return
 
     kind, raw = parse_item_id(item_id)
@@ -771,11 +832,14 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
     elif action == "reopen":
         reopen_poll(raw, poll)
         text = pad_for_width(f"📊 {poll['question']}")
-        edit_message(chat_id, message_id, text, {"inline_keyboard": [[
+        rows = [[
             {"text": "✏️ Modifica", "web_app": {"url": edit_form_url(raw)}},
             {"text": "🔒 Chiudi", "callback_data": f"mgmt|close|{raw}"},
             {"text": "📋 Log", "callback_data": f"mgmt|log|{raw}"},
-        ]]})
+        ]]
+        if poll.get("allow_external_share"):
+            rows.append([{"text": "↗️ Condividi in un'altra chat", "switch_inline_query": f"share|{raw}"}])
+        edit_message(chat_id, message_id, text, {"inline_keyboard": rows})
         answer_callback(callback_id, "Sondaggio riaperto.")
 
     elif action == "delete":
@@ -912,16 +976,17 @@ def handle_chosen_inline_result(cir: dict):
 
 
 def ensure_commands_registered():
-    """Registra una volta sola il menu comandi di Telegram (icona accanto
-    al campo di scrittura), così l'utente ha un elenco delle funzioni
-    disponibili senza doverle ricordare a memoria."""
-    if redis.get("commands_registered"):
+    """Registra il menu comandi di Telegram (icona accanto al campo di
+    scrittura). La chiave è "versionata": cambiandola si forza una
+    ri-registrazione se in futuro la lista comandi cambia di nuovo."""
+    if redis.get("commands_registered_v2"):
         return
     tg("setMyCommands", commands=[
         {"command": "newpoll", "description": "📊 Crea un sondaggio"},
         {"command": "polls", "description": "🗂 Gestisci i sondaggi"},
+        {"command": "admins", "description": "👥 Elenco amministratori del bot"},
     ])
-    redis.set("commands_registered", "1")
+    redis.set("commands_registered_v2", "1")
 
 
 @app.route("/api/webhook", methods=["POST"])
@@ -937,11 +1002,17 @@ def webhook():
 
         text = msg.get("text", "")
         if text.startswith("/start"):
-            cmd_start(chat_id, user_id, text.split()[1:])
+            cmd_start(chat_id, user_id, text.split()[1:], msg["from"])
         elif text.startswith("/newpoll") or text.startswith("/newrecurrent"):
             cmd_newpoll(chat_id, user_id)
         elif text.startswith("/polls"):
             cmd_polls(chat_id, user_id)
+        elif text.startswith("/addadmin"):
+            cmd_addadmin(chat_id, user_id, text.split()[1:])
+        elif text.startswith("/deladmin"):
+            cmd_deladmin(chat_id, user_id, text.split()[1:])
+        elif text.startswith("/admins"):
+            cmd_admins(chat_id, user_id)
         elif not text.startswith("/"):
             handle_option_suggestion(chat_id, user_id, text)
 
@@ -969,6 +1040,10 @@ def webhook():
             _, action, item_id = data.split("|")
             handle_mgmt_callback(callback_id, user["id"], msg_ref["chat"]["id"],
                                   msg_ref["message_id"], action, item_id)
+        elif data.startswith("admdel|") and msg_ref:
+            _, action, target_uid = data.split("|")
+            handle_admdel_callback(callback_id, user["id"], msg_ref["chat"]["id"],
+                                    msg_ref["message_id"], action, target_uid)
         elif data.startswith("vote|"):
             _, poll_id, idx = data.split("|")
             handle_vote_callback(callback_id, user, poll_id, int(idx))
@@ -1462,7 +1537,7 @@ def cron():
             text = f"📅 Promemoria: è il momento di pubblicare il sondaggio ricorrente #R{tid}:\n\n{tpl['question']}"
             for entry in admin_chats:
                 uid_str, chat_id_str = entry.split(":")
-                if is_channel_admin(int(uid_str)):
+                if is_bot_admin(int(uid_str)):
                     send_message(int(chat_id_str), text, keyboard)
                     sent += 1
             redis.set(dedup_key, "1", ex=172800)  # scade da solo dopo 2 giorni
