@@ -561,7 +561,7 @@ def cmd_start(chat_id, user_id, args, from_user):
     keyboard = {"inline_keyboard": [
         [{"text": "📊 Crea un sondaggio", "web_app": {"url": form_url}}],
         [{"text": "🗂 Gestisci i sondaggi", "callback_data": "startmenu|polls"}],
-        [{"text": "👥 Elenco amministratori del bot", "callback_data": "startmenu|admins"}],
+        [{"text": "👥 Gestisci gli amministratori", "callback_data": "startmenu|admins"}],
     ]}
     send_message(chat_id, pad_first_line(f"Benvenuto {name}, cosa posso fare per te oggi?"), keyboard)
 
@@ -625,17 +625,19 @@ def build_log_text(poll_id: str) -> str:
     return "\n".join(lines).strip()
 
 
-def pad_for_width(line: str, min_len: int = 60) -> str:
-    """Allarga la prima riga del messaggio (con spazi finali, invisibili)
-    così Telegram disegna una bolla più larga e i bottoni ci stanno
-    comodamente sulla stessa riga invece di essere compressi. Il valore
-    è scelto abbastanza alto da raggiungere la larghezza massima della
-    bolla su schermo, così tutti i messaggi con bottoni risultano larghi
-    allo stesso modo, indipendentemente dalla lunghezza del testo reale."""
-    return line if len(line) >= min_len else line + " " * (min_len - len(line))
+def pad_for_width(line: str, min_len: int = 24) -> str:
+    """Allarga la prima riga del messaggio (con spazi unificatori U+2003
+    finali, poco soggetti a essere "tagliati" nel calcolo della larghezza
+    a differenza dello spazio normale) così Telegram disegna una bolla
+    più larga e i bottoni ci stanno comodamente sulla stessa riga invece
+    di essere compressi. Il valore è scelto abbastanza alto da puntare
+    alla larghezza massima della bolla su schermo, così tutti i messaggi
+    con bottoni risultano larghi allo stesso modo, indipendentemente
+    dalla lunghezza del testo reale."""
+    return line if len(line) >= min_len else line + "\u2003" * (min_len - len(line))
 
 
-def pad_first_line(full_text: str, min_len: int = 60) -> str:
+def pad_first_line(full_text: str, min_len: int = 24) -> str:
     """Come pad_for_width, ma per un testo che può avere più righe:
     allarga solo la prima, lasciando invariato il resto."""
     if "\n" in full_text:
@@ -1057,23 +1059,26 @@ def handle_chosen_inline_result(cir: dict):
 
 
 def ensure_commands_registered():
-    """Registra il menu comandi di Telegram (icona '/') e imposta il
-    bottone-menu persistente (accanto al campo di scrittura) perché apra
-    direttamente la Web App di creazione sondaggio in un solo tap. La
-    chiave è "versionata": cambiandola si forza una ri-registrazione se
-    in futuro questa configurazione cambia di nuovo."""
-    if redis.get("commands_registered_v3"):
+    """Registra il menu comandi di Telegram (icona '/', ancora utile come
+    ripiego digitabile a mano) e imposta il bottone-menu persistente
+    perché apra un piccolo "launcher" con tre opzioni: crea sondaggio
+    (passa subito alla Web App di creazione), gestisci sondaggi e
+    gestisci amministratori (questi due mandano un segnale al bot che fa
+    partire /polls o /admins senza bisogno di scriverli). La chiave è
+    "versionata": cambiandola si forza una ri-registrazione se questa
+    configurazione cambia di nuovo in futuro."""
+    if redis.get("commands_registered_v5"):
         return
     tg("setMyCommands", commands=[
         {"command": "newpoll", "description": "📊 Crea un sondaggio"},
         {"command": "polls", "description": "🗂 Gestisci i sondaggi"},
-        {"command": "admins", "description": "👥 Elenco amministratori del bot"},
+        {"command": "admins", "description": "👥 Gestisci gli amministratori"},
     ])
-    form_url = request.host_url.rstrip("/") + "/api/pollform"
+    launcher_url = request.host_url.rstrip("/") + "/api/launcher"
     tg("setChatMenuButton", menu_button={
-        "type": "web_app", "text": "Crea sondaggio", "web_app": {"url": form_url}
+        "type": "web_app", "text": "Menu", "web_app": {"url": launcher_url}
     })
-    redis.set("commands_registered_v3", "1")
+    redis.set("commands_registered_v5", "1")
 
 
 @app.route("/api/webhook", methods=["POST"])
@@ -1086,6 +1091,20 @@ def webhook():
         msg = update["message"]
         chat_id = msg["chat"]["id"]
         user_id = msg["from"]["id"]
+
+        if "web_app_data" in msg:
+            # Segnale dal "launcher" del bottone-menu (non dalla vera
+            # creazione sondaggio, che passa da /api/submitpoll).
+            try:
+                launcher_action = json.loads(msg["web_app_data"]["data"]).get("action")
+            except (ValueError, TypeError):
+                launcher_action = None
+            if is_bot_admin(user_id):
+                if launcher_action == "polls":
+                    cmd_polls(chat_id, user_id)
+                elif launcher_action == "admins":
+                    cmd_admins(chat_id, user_id)
+            return {"ok": True}
 
         text = msg.get("text", "")
         if text.startswith("/start"):
@@ -1540,6 +1559,79 @@ def submitpoll():
 @app.route("/api/pollform", methods=["GET"])
 def pollform():
     return POLLFORM_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+LAUNCHER_HTML = """<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Menu</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #efeff4; --card: #ffffff; --text: #000000; --hint: #8e8e93;
+    --link: #007aff; --button: #007aff; --button-text: #ffffff;
+    --separator: #e3e3e8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 16px;
+  }
+  h1 { font-size: 17px; margin: 4px 4px 14px; }
+  .card { background: var(--card); border-radius: 14px; overflow: hidden; margin-bottom: 12px; }
+  .item {
+    display: flex; align-items: center; gap: 14px; padding: 16px;
+    border-bottom: 1px solid var(--separator); cursor: pointer;
+  }
+  .item:last-child { border-bottom: none; }
+  .item .emoji { font-size: 22px; }
+  .item .label { font-size: 16px; font-weight: 500; }
+</style>
+</head>
+<body>
+
+<h1>Cosa vuoi fare?</h1>
+<div class="card">
+  <div class="item" id="btnNew"><span class="emoji">📊</span><span class="label">Crea un sondaggio</span></div>
+  <div class="item" id="btnPolls"><span class="emoji">🗂</span><span class="label">Gestisci i sondaggi</span></div>
+  <div class="item" id="btnAdmins"><span class="emoji">👥</span><span class="label">Gestisci gli amministratori</span></div>
+</div>
+
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready();
+tg.expand();
+
+const tp = tg.themeParams || {};
+const root = document.documentElement.style;
+if (tp.bg_color) root.setProperty('--bg', tp.bg_color);
+if (tp.text_color) root.setProperty('--text', tp.text_color);
+if (tp.hint_color) root.setProperty('--hint', tp.hint_color);
+if (tp.link_color) root.setProperty('--link', tp.link_color);
+if (tp.button_color) root.setProperty('--button', tp.button_color);
+if (tp.button_text_color) root.setProperty('--button-text', tp.button_text_color);
+if (tp.secondary_bg_color) root.setProperty('--card', tp.secondary_bg_color);
+
+document.getElementById('btnNew').addEventListener('click', () => {
+  location.href = '/api/pollform';
+});
+document.getElementById('btnPolls').addEventListener('click', () => {
+  tg.sendData(JSON.stringify({ action: 'polls' }));
+});
+document.getElementById('btnAdmins').addEventListener('click', () => {
+  tg.sendData(JSON.stringify({ action: 'admins' }));
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/api/launcher", methods=["GET"])
+def launcher():
+    return LAUNCHER_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.route("/api/pollformdata", methods=["GET"])
