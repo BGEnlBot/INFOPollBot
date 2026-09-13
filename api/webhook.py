@@ -401,23 +401,19 @@ def edit_form_url(id_str: str) -> str:
 
 def resolve_user_id(raw: str):
     """
-    Accetta un ID numerico o uno @username e ritorna (id, errore).
-    Per lo username funziona SOLO se quella persona ha già scritto
-    almeno un messaggio al bot in passato: è un limite di Telegram
-    stesso (i bot non possono cercare utenti mai visti prima), non
-    aggirabile lato codice.
+    Accetta SOLO un ID numerico e ritorna (id, errore).
+    La ricerca per @username non è possibile: l'API dei bot Telegram
+    non supporta la risoluzione di un utente privato a partire dal suo
+    username, nemmeno se ha già scritto al bot — è un limite della
+    piattaforma stessa (confermato anche da una segnalazione di bug
+    ufficiale a Telegram), non aggirabile lato codice.
     """
-    raw = raw.strip()
+    raw = raw.strip().lstrip("@")
     if raw.isdigit():
         return raw, None
-
-    username = raw.lstrip("@")
-    res = tg("getChat", chat_id=f"@{username}")
-    if not res.get("ok") or res.get("result", {}).get("type") != "private":
-        return None, (f"Non trovo @{username}. Questo funziona solo se quella persona ha già "
-                       f"scritto almeno un messaggio al bot (anche solo /start). "
-                       f"In alternativa, chiedile il suo ID numerico su @userinfobot.")
-    return str(res["result"]["id"]), None
+    return None, ("La ricerca per username non è supportata dall'API dei bot Telegram "
+                   "(nemmeno se quella persona ha già scritto al bot). "
+                   "Serve l'ID numerico: chiedile di scrivere a @userinfobot per trovarlo.")
 
 
 def cmd_addadmin(chat_id, user_id, args):
@@ -425,9 +421,8 @@ def cmd_addadmin(chat_id, user_id, args):
         send_message(chat_id, "Comando riservato agli amministratori del bot.")
         return
     if not args:
-        send_message(chat_id, "Uso: /addadmin ID_UTENTE oppure /addadmin @username\n\n"
-                               "Lo username funziona solo se quella persona ha già scritto "
-                               "al bot almeno una volta.")
+        send_message(chat_id, "Uso: /addadmin ID_UTENTE\n\n"
+                               "L'ID numerico si trova scrivendo a @userinfobot.")
         return
     new_id, err = resolve_user_id(args[0])
     if err:
@@ -512,10 +507,9 @@ def handle_admadd_callback(callback_id, user_id, chat_id):
         answer_callback(callback_id, "Riservato agli amministratori del bot.", alert=True)
         return
     redis.set(f"awaiting_newadmin:{user_id}", "1")
-    send_message(chat_id, "Scrivi lo @username oppure l'ID numerico del nuovo amministratore.\n\n"
-                           "Lo username funziona solo se quella persona ha già scritto al bot "
-                           "almeno una volta (anche solo /start): è un limite di Telegram stesso. "
-                           "In alternativa, l'ID numerico si trova scrivendo a @userinfobot.")
+    send_message(chat_id, "Scrivi l'ID Telegram numerico del nuovo amministratore.\n\n"
+                           "Si trova scrivendo a @userinfobot (la ricerca per username non è "
+                           "possibile: è un limite dell'API dei bot Telegram, non aggirabile).")
     answer_callback(callback_id)
 
 
@@ -1090,20 +1084,6 @@ def webhook():
         chat_id = msg["chat"]["id"]
         user_id = msg["from"]["id"]
 
-        if "web_app_data" in msg:
-            # Segnale dal "launcher" del bottone-menu (non dalla vera
-            # creazione sondaggio, che passa da /api/submitpoll).
-            try:
-                launcher_action = json.loads(msg["web_app_data"]["data"]).get("action")
-            except (ValueError, TypeError):
-                launcher_action = None
-            if is_bot_admin(user_id):
-                if launcher_action == "polls":
-                    cmd_polls(chat_id, user_id)
-                elif launcher_action == "admins":
-                    cmd_admins(chat_id, user_id)
-            return {"ok": True}
-
         text = msg.get("text", "")
         if text.startswith("/start"):
             cmd_start(chat_id, user_id, text.split()[1:], msg["from"])
@@ -1554,6 +1534,34 @@ def submitpoll():
     return {"ok": ok, "message": message}
 
 
+@app.route("/api/launcheraction", methods=["POST"])
+def launcheraction():
+    """Riceve i tap sui bottoni 'Gestisci' del launcher (bottone-menu).
+    Non usa sendData perché quel meccanismo funziona SOLO per le Web App
+    aperte da un bottone-tastiera, non dal bottone-menu persistente."""
+    body = request.get_json(force=True, silent=True) or {}
+    init_data = body.get("initData", "")
+    action = body.get("action", "")
+
+    user = validate_init_data(init_data)
+    if not user:
+        return {"ok": False, "message": "Sessione non valida, riapri la schermata da Telegram."}, 401
+
+    user_id = user.get("id")
+    chat_id = user_id
+    if not is_bot_admin(user_id):
+        return {"ok": False, "message": "Riservato agli amministratori del bot."}, 403
+
+    if action == "polls":
+        cmd_polls(chat_id, user_id)
+    elif action == "admins":
+        cmd_admins(chat_id, user_id)
+    else:
+        return {"ok": False, "message": "Azione non riconosciuta."}, 400
+
+    return {"ok": True, "message": "Fatto."}
+
+
 @app.route("/api/pollform", methods=["GET"])
 def pollform():
     return POLLFORM_HTML, 200, {"Content-Type": "text/html; charset=utf-8",
@@ -1616,12 +1624,26 @@ if (tp.secondary_bg_color) root.setProperty('--card', tp.secondary_bg_color);
 document.getElementById('btnNew').addEventListener('click', () => {
   location.href = '/api/pollform';
 });
-document.getElementById('btnPolls').addEventListener('click', () => {
-  tg.sendData(JSON.stringify({ action: 'polls' }));
-});
-document.getElementById('btnAdmins').addEventListener('click', () => {
-  tg.sendData(JSON.stringify({ action: 'admins' }));
-});
+
+function runAction(action) {
+  fetch('/api/launcheraction', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ initData: tg.initData, action: action }),
+  })
+    .then(r => r.json())
+    .then(res => {
+      if (res.ok) {
+        tg.close();
+      } else {
+        alert(res.message || 'Si è verificato un errore, riprova.');
+      }
+    })
+    .catch(() => alert('Errore di connessione, riprova.'));
+}
+
+document.getElementById('btnPolls').addEventListener('click', () => runAction('polls'));
+document.getElementById('btnAdmins').addEventListener('click', () => runAction('admins'));
 </script>
 </body>
 </html>
