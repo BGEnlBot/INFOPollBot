@@ -478,20 +478,20 @@ def cmd_admins(chat_id, user_id):
         return
 
     for uid in sorted(INITIAL_ADMIN_IDS):
-        text = pad_for_width("🔒 Fixed administrator") + f"\n{get_display_name(uid)}"
+        text = f"🔒 Fixed administrator (set via environment variable)\n{get_display_name(uid)}"
         keyboard = {"inline_keyboard": [[
             {"text": "🔒 Not removable here", "callback_data": f"admdel|fixed|{uid}"}
         ]]}
         send_message(chat_id, text, keyboard)
 
     for uid in dynamic_ids:
-        text = pad_for_width("👤 Administrator") + f"\n{get_display_name(uid)}"
+        text = f"👤 Administrator (added with /addadmin)\n{get_display_name(uid)}"
         keyboard = {"inline_keyboard": [[
             {"text": "🗑️ Remove", "callback_data": f"admdel|remove|{uid}"}
         ]]}
         send_message(chat_id, text, keyboard)
 
-    send_message(chat_id, pad_for_width("➕ Add a new administrator"),
+    send_message(chat_id, "➕ Tap below to add a new bot administrator",
                  {"inline_keyboard": [[{"text": "➕ Add administrator", "callback_data": "admadd"}]]})
 
 
@@ -601,7 +601,7 @@ def cmd_newpoll(chat_id, user_id):
     remember_admin_chat(user_id, chat_id)
     form_url = request.host_url.rstrip("/") + "/api/pollform"
     keyboard = {"inline_keyboard": [[{"text": "📊 Create poll", "web_app": {"url": form_url}}]]}
-    send_message(chat_id, pad_for_width("📊 New poll"), keyboard)
+    send_message(chat_id, "📊 Tap below to open the poll creation screen", keyboard)
 
 
 def build_log_text(poll_id: str) -> str:
