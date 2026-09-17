@@ -256,14 +256,15 @@ def remember_admin_chat(user_id: int, chat_id: int):
 
 def build_text(poll: dict) -> str:
     """Genera il testo del messaggio in HTML (Telegram parse_mode=HTML)."""
-    lines = [format_rich_text(poll['question']), ""]
+    lines = [f"<i>{format_rich_text(poll['question'])}</i>", ""]
     for i, opt in enumerate(poll["options"]):
         voters = [v["name"] for v in poll["votes"].values() if i in v["choices"]]
         mark = "✅ " if poll["quiz"] and i == poll["correct_index"] and poll["closed"] else ""
-        lines.append(f"▫️ {mark}{esc(opt)} — {len(voters)} votes")
+        lines.append(f"{mark}<b>{esc(opt)}</b> ({len(voters)} votes)")
         if voters and not poll["anonymous"]:
-            lines.append("   " + esc(", ".join(voters)))
-    lines.append("")
+            for name in voters:
+                lines.append(f"- {esc(name)}")
+        lines.append("")
     tags = ["anonymous" if poll["anonymous"] else "public votes",
             "multiple answers" if poll["multiple"] else "single answer"]
     if poll["quiz"]:
