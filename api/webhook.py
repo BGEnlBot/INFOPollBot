@@ -256,7 +256,7 @@ def remember_admin_chat(user_id: int, chat_id: int):
 
 def build_text(poll: dict) -> str:
     """Genera il testo del messaggio in HTML (Telegram parse_mode=HTML)."""
-    lines = [f"<i>{format_rich_text(poll['question'])}</i>", ""]
+    lines = [format_rich_text(poll['question']), ""]
     for i, opt in enumerate(poll["options"]):
         voters = [v["name"] for v in poll["votes"].values() if i in v["choices"]]
         mark = "✅ " if poll["quiz"] and i == poll["correct_index"] and poll["closed"] else ""
@@ -562,7 +562,7 @@ def cmd_start(chat_id, user_id, args, from_user):
         [{"text": "🗂 Manage polls", "callback_data": "startmenu|polls"}],
         [{"text": "👥 Manage administrators", "callback_data": "startmenu|admins"}],
     ]}
-    send_message(chat_id, pad_first_line(f"Welcome {name}, what can I do for you today?"), keyboard)
+    send_message(chat_id, f"Welcome {name}, what can I do for you today?", keyboard)
 
 
 def handle_option_suggestion(chat_id, user_id, text):
@@ -624,23 +624,18 @@ def build_log_text(poll_id: str) -> str:
     return "\n".join(lines).strip()
 
 
-def pad_for_width(line: str, min_len: int = 50) -> str:
-    """Allarga la prima riga del messaggio ripetendo un carattere "braille
-    vuoto" (U+2800): a differenza dello spazio normale, questo non è
-    classificato come spazio bianco a livello tecnico, quindi ha meno
-    probabilità di essere tagliato quando Telegram calcola la larghezza
-    della bolla — ma resta comunque un trucco non documentato
-    ufficialmente da Telegram, quindi va verificato "a vista"."""
-    return line if len(line) >= min_len else line + "\u2800" * (min_len - len(line))
-
-
-def pad_first_line(full_text: str, min_len: int = 50) -> str:
-    """Come pad_for_width, ma per un testo che può avere più righe:
-    allarga solo la prima, lasciando invariato il resto."""
-    if "\n" in full_text:
-        first, rest = full_text.split("\n", 1)
-        return pad_for_width(first, min_len) + "\n" + rest
-    return pad_for_width(full_text, min_len)
+def ensure_min_width(text: str, filler_line: str, min_len: int = 45) -> str:
+    """
+    I caratteri invisibili NON allargano la bolla dei messaggi su Telegram
+    (verificato con più tentativi falliti): la larghezza dipende dal testo
+    reale visibile. Quindi, se nessuna riga del messaggio raggiunge una
+    lunghezza minima, aggiunge una riga finale con un'informazione reale
+    (non riempitivo), garantendo che i bottoni sotto siano sempre leggibili
+    e alla larghezza massima, in modo affidabile.
+    """
+    if any(len(line) >= min_len for line in text.split("\n")):
+        return text
+    return text + "\n" + filler_line
 
 
 def cmd_polls(chat_id, user_id):
@@ -660,14 +655,16 @@ def cmd_polls(chat_id, user_id):
         if not p:
             continue
         if p["closed"]:
-            text = pad_for_width(f"🔒 {p['question']}") + "\n(closed)"
+            text = ensure_min_width(f"🔒 {p['question']}\n(closed)",
+                                     "This poll is closed — tap a button below")
             keyboard = {"inline_keyboard": [[
                 {"text": "🗑️ Delete", "callback_data": f"mgmt|delete|{pid}"},
                 {"text": "🔓 Reopen", "callback_data": f"mgmt|reopen|{pid}"},
                 {"text": "📋 Log", "callback_data": f"mgmt|log|{pid}"},
             ]]}
         else:
-            text = pad_for_width(f"📊 {p['question']}")
+            text = ensure_min_width(f"📊 {p['question']}",
+                                     "Tap a button below to manage this poll")
             keyboard = {"inline_keyboard": [
                 [
                     {"text": "✏️ Edit", "web_app": {"url": edit_form_url(pid)}},
@@ -685,9 +682,9 @@ def cmd_polls(chat_id, user_id):
         if not t:
             continue
         rid = f"R{tid}"
-        first_line = pad_for_width(
-            f"📅 Scheduled poll (every {WEEKDAY_NAMES[t['weekday']]})")
-        text = f"{first_line}\n{t['question']}"
+        text = ensure_min_width(
+            f"📅 Scheduled poll (every {WEEKDAY_NAMES[t['weekday']]})\n{t['question']}",
+            "Tap a button below to manage this scheduled poll")
         keyboard = {"inline_keyboard": [[
             {"text": "✏️ Edit", "web_app": {"url": edit_form_url(rid)}},
             {"text": "🗑️ Delete", "callback_data": f"mgmt|delete|{rid}"},
@@ -712,9 +709,9 @@ def handle_poll_edit(chat_id, user_id, payload):
     if not question:
         send_message(chat_id, "The question cannot be empty. Edit cancelled.")
         return False, "The question cannot be empty."
-    if not (2 <= len(new_options) <= 10):
-        send_message(chat_id, "You need between 2 and 10 options. Edit cancelled.")
-        return False, "You need between 2 and 10 options."
+    if not (1 <= len(new_options) <= 10):
+        send_message(chat_id, "You need between 1 and 10 options. Edit cancelled.")
+        return False, "You need between 1 and 10 options."
 
     # Rimappa i voti esistenti: le opzioni il cui testo non è cambiato
     # mantengono i voti; le opzioni rimosse o rinominate perdono i loro
@@ -759,7 +756,7 @@ def handle_poll_edit(chat_id, user_id, payload):
         send_message(chat_id, "✅ Poll updated.")
     else:
         # È ancora una bozza non pubblicata: si torna alla preview.
-        send_message(chat_id, pad_first_line(build_text(poll)), build_preview_keyboard(poll), parse_mode="HTML")
+        send_message(chat_id, ensure_min_width(build_text(poll), "Review it, then tap a button below"), build_preview_keyboard(poll), parse_mode="HTML")
     return True, "Poll updated."
 
 
@@ -775,9 +772,9 @@ def handle_template_edit(chat_id, user_id, payload):
     if not question:
         send_message(chat_id, "The question cannot be empty. Edit cancelled.")
         return False, "The question cannot be empty."
-    if not (2 <= len(new_options) <= 10):
-        send_message(chat_id, "You need between 2 and 10 options. Edit cancelled.")
-        return False, "You need between 2 and 10 options."
+    if not (1 <= len(new_options) <= 10):
+        send_message(chat_id, "You need between 1 and 10 options. Edit cancelled.")
+        return False, "You need between 1 and 10 options."
 
     weekday = payload.get("weekday")
     if weekday is None or not (0 <= int(weekday) <= 6):
@@ -822,8 +819,8 @@ def handle_web_app_data(chat_id, user_id, payload):
 
     if not question:
         return False, "The question cannot be empty."
-    if not (2 <= len(options) <= 10):
-        return False, "You need between 2 and 10 options."
+    if not (1 <= len(options) <= 10):
+        return False, "You need between 1 and 10 options."
 
     fields = {
         "question": question,
@@ -848,7 +845,7 @@ def handle_web_app_data(chat_id, user_id, payload):
         return True, "Recurring poll saved."
     else:
         poll = create_draft(fields, chat_id)
-        send_message(chat_id, pad_first_line(build_text(poll)), build_preview_keyboard(poll), parse_mode="HTML")
+        send_message(chat_id, ensure_min_width(build_text(poll), "Review it, then tap a button below"), build_preview_keyboard(poll), parse_mode="HTML")
         return True, "Draft ready: review it and publish it."
 
 
@@ -863,7 +860,7 @@ def handle_recur_callback(callback_id, user_id, chat_id, message_id, tpl_id):
         answer_callback(callback_id, "Template no longer available.", alert=True)
         return
     poll = create_draft(extract_fields(tpl), chat_id)
-    edit_message(chat_id, message_id, pad_first_line(build_text(poll)), build_preview_keyboard(poll), parse_mode="HTML")
+    edit_message(chat_id, message_id, ensure_min_width(build_text(poll), "Review it, then tap a button below"), build_preview_keyboard(poll), parse_mode="HTML")
     answer_callback(callback_id)
 
 
@@ -898,7 +895,8 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
 
     elif action == "close":
         close_poll_only(raw, poll)
-        text = pad_for_width(f"🔒 {poll['question']}") + "\n(closed)"
+        text = ensure_min_width(f"🔒 {poll['question']}\n(closed)",
+                                 "This poll is closed — tap a button below")
         edit_message(chat_id, message_id, text, {"inline_keyboard": [[
             {"text": "🗑️ Delete", "callback_data": f"mgmt|delete|{raw}"},
             {"text": "🔓 Reopen", "callback_data": f"mgmt|reopen|{raw}"},
@@ -908,7 +906,7 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
 
     elif action == "reopen":
         reopen_poll(raw, poll)
-        text = pad_for_width(f"📊 {poll['question']}")
+        text = ensure_min_width(f"📊 {poll['question']}", "Tap a button below to manage this poll")
         rows = [
             [
                 {"text": "✏️ Edit", "web_app": {"url": edit_form_url(raw)}},
@@ -1349,7 +1347,7 @@ function mountAddRow() {
 }
 mountAddRow();
 
-addOption(''); addOption('');
+addOption('');
 
 // ---- Modalità modifica: se la Web App è aperta con ?edit=ID, precompila ----
 const urlParams = new URLSearchParams(location.search);
@@ -1461,7 +1459,7 @@ document.getElementById('question').addEventListener('input', validate);
 function validate() {
   const question = document.getElementById('question').value.trim();
   const opts = [...document.querySelectorAll('.opt-input')].map(i => i.value.trim()).filter(Boolean);
-  const ok = question.length > 0 && opts.length >= 2;
+  const ok = question.length > 0 && opts.length >= 1;
   document.getElementById('createBtn').disabled = !ok;
 }
 
@@ -1745,8 +1743,7 @@ def cron():
             keyboard = {"inline_keyboard": [[
                 {"text": "✅ Create poll now", "callback_data": f"recur|{tid}"}
             ]]}
-            text = pad_first_line(
-                f"📅 Reminder: it's time to publish the recurring poll #R{tid}:\n\n{tpl['question']}")
+            text = (f"📅 Reminder: it's time to publish the recurring poll #R{tid}:\n\n{tpl['question']}")
             for entry in admin_chats:
                 uid_str, chat_id_str = entry.split(":")
                 if is_bot_admin(int(uid_str)):
