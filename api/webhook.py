@@ -617,8 +617,13 @@ def build_log_text(poll_id: str) -> str:
     lines = ["📋 Vote summary", ""]
     for uid in sorted(per_user_events, key=lambda u: per_user_name[u].lower()):
         lines.append(f"👤 {per_user_name[uid]}")
-        for i, e in enumerate(per_user_events[uid]):
-            label = "First vote" if i == 0 else "Vote changed"
+        for e in per_user_events[uid]:
+            if e.get("event_type") == "vote_removed":
+                label = "Vote withdrawn"
+            elif e.get("event_type") == "vote":
+                label = "First vote"
+            else:
+                label = "Vote changed"
             lines.append(f"{label}: {e['new_choice']}")
         lines.append("")
     return "\n".join(lines).strip()
@@ -949,18 +954,23 @@ def handle_vote_callback(callback_id, user, poll_id, idx):
         else:
             entry["choices"].append(idx)
     else:
-        entry["choices"] = [idx]
+        if entry["choices"] == [idx]:
+            entry["choices"] = []  # tap sull'opzione già votata: ritira il voto
+        else:
+            entry["choices"] = [idx]
 
     entry["name"] = name
     poll["votes"][uid] = entry
     set_json(f"poll:{poll_id}", poll)
 
     new_names = [poll["options"][i] for i in entry["choices"]]
-    log_event(poll_id, user, "vote_changed" if had_voted_before else "vote",
-              ", ".join(old_names), ", ".join(new_names) or "(nessuna)")
+    event_type = "vote_removed" if had_voted_before and not new_names else \
+                 ("vote_changed" if had_voted_before else "vote")
+    log_event(poll_id, user, event_type, ", ".join(old_names), ", ".join(new_names) or "(none)")
 
     sync_poll(poll)
-    answer_callback(callback_id, f"Vote recorded: {', '.join(new_names) or 'no selection'}")
+    confirmation = f"Vote recorded: {', '.join(new_names)}" if new_names else "Vote withdrawn."
+    answer_callback(callback_id, confirmation)
 
 
 # ================= ENTRY POINT WEBHOOK =================
