@@ -692,6 +692,7 @@ def cmd_polls(chat_id, user_id):
             "Tap a button below to manage this scheduled poll")
         keyboard = {"inline_keyboard": [[
             {"text": "✏️ Edit", "web_app": {"url": edit_form_url(rid)}},
+            {"text": "🚀 Publish now", "callback_data": f"mgmt|publish|{rid}"},
             {"text": "🗑️ Delete", "callback_data": f"mgmt|delete|{rid}"},
         ]]}
         send_message(chat_id, text, keyboard)
@@ -885,6 +886,11 @@ def handle_mgmt_callback(callback_id, user_id, chat_id, message_id, action, item
             delete_template_completely(raw, tpl)
             edit_message(chat_id, message_id, "🗑️ Recurring poll deleted.")
             answer_callback(callback_id, "Deleted.")
+        elif action == "publish":
+            poll = create_draft(extract_fields(tpl), chat_id)
+            send_message(chat_id, ensure_min_width(build_text(poll), "Review it, then tap a button below"),
+                         build_preview_keyboard(poll), parse_mode="HTML")
+            answer_callback(callback_id)
         else:
             answer_callback(callback_id, "This action is not available for a recurring poll.", alert=True)
         return
