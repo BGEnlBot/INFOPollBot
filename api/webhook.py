@@ -1614,6 +1614,7 @@ LAUNCHER_HTML = """<!DOCTYPE html>
   .item:last-child { border-bottom: none; }
   .item .emoji { font-size: 22px; }
   .item .label { font-size: 16px; font-weight: 500; }
+  .item.loading { opacity: 0.5; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -1644,7 +1645,13 @@ document.getElementById('btnNew').addEventListener('click', () => {
   location.href = '/api/pollform';
 });
 
-function runAction(action) {
+let actionInProgress = false;
+
+function runAction(action, el) {
+  if (actionInProgress) return;  // ignora tocchi ripetuti mentre una richiesta è già in corso
+  actionInProgress = true;
+  el.classList.add('loading');
+
   fetch('/api/launcheraction', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1656,13 +1663,19 @@ function runAction(action) {
         tg.close();
       } else {
         alert(res.message || 'Something went wrong, please try again.');
+        actionInProgress = false;
+        el.classList.remove('loading');
       }
     })
-    .catch(() => alert('Connection error, please try again.'));
+    .catch(() => {
+      alert('Connection error, please try again.');
+      actionInProgress = false;
+      el.classList.remove('loading');
+    });
 }
 
-document.getElementById('btnPolls').addEventListener('click', () => runAction('polls'));
-document.getElementById('btnAdmins').addEventListener('click', () => runAction('admins'));
+document.getElementById('btnPolls').addEventListener('click', (e) => runAction('polls', e.currentTarget));
+document.getElementById('btnAdmins').addEventListener('click', (e) => runAction('admins', e.currentTarget));
 </script>
 </body>
 </html>
