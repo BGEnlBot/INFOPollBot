@@ -692,7 +692,7 @@ def cmd_polls(chat_id, user_id):
             "Tap a button below to manage this scheduled poll")
         keyboard = {"inline_keyboard": [[
             {"text": "✏️ Edit", "web_app": {"url": edit_form_url(rid)}},
-            {"text": "🚀 Publish now", "callback_data": f"mgmt|publish|{rid}"},
+            {"text": "🚀 Publish", "callback_data": f"mgmt|publish|{rid}"},
             {"text": "🗑️ Delete", "callback_data": f"mgmt|delete|{rid}"},
         ]]}
         send_message(chat_id, text, keyboard)
